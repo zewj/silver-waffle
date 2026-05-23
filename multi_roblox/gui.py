@@ -5,6 +5,7 @@ from tkinter import messagebox, ttk
 
 from . import servers
 from .accounts import AccountStore
+from .config import ConfigStore, Preset
 from .manager import InstanceManager
 
 _NO_ACCOUNT = "(launcher's signed-in account)"
@@ -14,19 +15,24 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Multi Roblox Manager")
-        self.geometry("820x520")
-        self.minsize(720, 420)
+        self.geometry("960x600")
+        self.minsize(820, 480)
 
         self.store = AccountStore()
+        self.config = ConfigStore()
         self.manager = InstanceManager()
+        self.manager.LAUNCH_COOLDOWN = self.config.cfg.launch_cooldown
         self.manager.start()
 
         self._build_ui()
         self._refresh_accounts_dropdown()
+        self._refresh_presets()
         self._refresh_tree()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind_all("<Control-Tab>", lambda _e: self._cycle())
+
+    # ---- layout ----------------------------------------------------------
 
     def _build_ui(self):
         top = ttk.Frame(self, padding=10)
@@ -34,7 +40,7 @@ class App(tk.Tk):
 
         ttk.Label(top, text="Game (placeId or URL):").pack(side=tk.LEFT)
         self.place_var = tk.StringVar()
-        ttk.Entry(top, textvariable=self.place_var, width=36).pack(side=tk.LEFT, padx=6)
+        ttk.Entry(top, textvariable=self.place_var, width=34).pack(side=tk.LEFT, padx=6)
 
         ttk.Label(top, text="Account:").pack(side=tk.LEFT)
         self.account_var = tk.StringVar()
@@ -43,39 +49,68 @@ class App(tk.Tk):
 
         ttk.Label(top, text="Label:").pack(side=tk.LEFT)
         self.label_var = tk.StringVar()
-        ttk.Entry(top, textvariable=self.label_var, width=12).pack(side=tk.LEFT, padx=6)
+        ttk.Entry(top, textvariable=self.label_var, width=14).pack(side=tk.LEFT, padx=6)
 
         ttk.Button(top, text="Launch", command=self._on_launch).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text="Save Preset", command=self._on_save_preset).pack(side=tk.LEFT, padx=4)
         ttk.Button(top, text="Accounts…", command=self._open_account_manager).pack(side=tk.LEFT, padx=4)
 
+        # Body: live instances on the left, saved presets on the right.
+        body = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 4))
+
+        live_frame = ttk.LabelFrame(body, text="Running instances", padding=6)
+        body.add(live_frame, weight=3)
         cols = ("label", "account", "place", "pid", "job")
-        self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="browse")
+        self.tree = ttk.Treeview(live_frame, columns=cols, show="headings", selectmode="browse")
         for col, head, w in (
             ("label", "Label", 130),
-            ("account", "Account", 160),
-            ("place", "Place ID", 110),
+            ("account", "Account", 150),
+            ("place", "Place ID", 100),
             ("pid", "PID", 70),
-            ("job", "Server (jobId)", 320),
+            ("job", "Server (jobId)", 280),
         ):
             self.tree.heading(col, text=head)
             self.tree.column(col, width=w, anchor=tk.W)
-        self.tree.pack(fill=tk.BOTH, expand=True, padx=10)
+        self.tree.pack(fill=tk.BOTH, expand=True)
 
-        actions = ttk.Frame(self, padding=10)
+        preset_frame = ttk.LabelFrame(body, text="Saved presets (persist across restarts)", padding=6)
+        body.add(preset_frame, weight=2)
+        self.preset_list = tk.Listbox(preset_frame, activestyle="dotbox")
+        self.preset_list.pack(fill=tk.BOTH, expand=True)
+        preset_btns = ttk.Frame(preset_frame)
+        preset_btns.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(preset_btns, text="Launch", command=self._on_launch_preset).pack(side=tk.LEFT, padx=2)
+        ttk.Button(preset_btns, text="Launch All", command=self._on_launch_all_presets).pack(side=tk.LEFT, padx=2)
+        ttk.Button(preset_btns, text="Remove", command=self._on_remove_preset).pack(side=tk.LEFT, padx=2)
+        self.preset_list.bind("<Double-1>", lambda _e: self._on_launch_preset())
+
+        actions = ttk.Frame(self, padding=(10, 4))
         actions.pack(fill=tk.X)
         ttk.Button(actions, text="Focus", command=self._on_focus).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Cycle (Ctrl+Tab)", command=self._cycle).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Server Hop", command=self._on_hop).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Close Instance", command=self._on_close_instance).pack(side=tk.LEFT, padx=4)
 
-        self.status_var = tk.StringVar(value="Ready. Mutex held — extra clients can launch.")
+        self.status_var = tk.StringVar(value="Ready. Mutex held; ticket-authed launches bypass the official launcher.")
         ttk.Label(self, textvariable=self.status_var, anchor=tk.W, padding=(10, 4)).pack(fill=tk.X, side=tk.BOTTOM)
+
+    # ---- helpers ---------------------------------------------------------
 
     def _refresh_accounts_dropdown(self):
         labels = [_NO_ACCOUNT] + [a.label() for a in self.store]
         self.account_combo["values"] = labels
         if self.account_var.get() not in labels:
             self.account_var.set(labels[0])
+
+    def _refresh_presets(self):
+        self.preset_list.delete(0, tk.END)
+        for p in self.config.cfg.presets:
+            account = self.store.find(p.account_user_id) if p.account_user_id else None
+            acc_label = account.label() if account else (
+                "[missing account]" if p.account_user_id else "(signed-in)"
+            )
+            self.preset_list.insert(tk.END, f"{p.label}  ·  place {p.place_id}  ·  {acc_label}")
 
     def _resolve_selected_account(self):
         choice = self.account_var.get()
@@ -127,6 +162,8 @@ class App(tk.Tk):
             on_done(result)
         self._refresh_tree()
 
+    # ---- live instance actions ------------------------------------------
+
     def _on_launch(self):
         place_id = servers.parse_place_id(self.place_var.get())
         if not place_id:
@@ -134,6 +171,7 @@ class App(tk.Tk):
             return
         account = self._resolve_selected_account()
         label = self.label_var.get().strip() or (account.label() if account else f"Instance {len(self.manager.instances) + 1}")
+        self.config.remember(place_id)
         self._set_status(f"Launching {label}…")
         self._run_async(
             lambda: self.manager.add_instance(label, place_id, account=account),
@@ -174,8 +212,81 @@ class App(tk.Tk):
         self._refresh_tree()
         self._set_status(f"Closed {inst.label}")
 
+    # ---- preset actions --------------------------------------------------
+
+    def _on_save_preset(self):
+        place_id = servers.parse_place_id(self.place_var.get())
+        if not place_id:
+            messagebox.showwarning("Invalid", "Enter a placeId or URL to save.")
+            return
+        account = self._resolve_selected_account()
+        label = self.label_var.get().strip() or (account.label() if account else f"Preset {len(self.config.cfg.presets) + 1}")
+        self.config.upsert(Preset(
+            label=label, place_id=place_id,
+            account_user_id=account.user_id if account else None,
+        ))
+        self._refresh_presets()
+        self._set_status(f"Saved preset '{label}'.")
+
+    def _selected_preset_index(self):
+        sel = self.preset_list.curselection()
+        return sel[0] if sel else None
+
+    def _launch_preset(self, preset: Preset):
+        account = self.store.find(preset.account_user_id) if preset.account_user_id else None
+        if preset.account_user_id and account is None:
+            self._set_status(f"Preset '{preset.label}': saved account missing; falling back to signed-in.")
+        self._set_status(f"Launching {preset.label}…")
+        self._run_async(
+            lambda: self.manager.add_instance(preset.label, preset.place_id, account=account),
+            on_done=lambda inst: self._set_status(
+                f"{inst.label} launched (pid={inst.pid})" if inst.pid else f"{inst.label}: pid not detected"
+            ),
+        )
+
+    def _on_launch_preset(self):
+        idx = self._selected_preset_index()
+        if idx is None:
+            return
+        self._launch_preset(self.config.cfg.presets[idx])
+
+    def _on_launch_all_presets(self):
+        presets = list(self.config.cfg.presets)
+        if not presets:
+            return
+        self._set_status(f"Launching {len(presets)} preset(s)…")
+
+        def run_all():
+            results = []
+            for p in presets:
+                account = self.store.find(p.account_user_id) if p.account_user_id else None
+                try:
+                    inst = self.manager.add_instance(p.label, p.place_id, account=account)
+                    results.append((p.label, inst.pid))
+                except Exception as e:
+                    results.append((p.label, f"error: {e}"))
+            return results
+
+        self._run_async(
+            run_all,
+            on_done=lambda results: self._set_status(
+                "Launched: " + ", ".join(f"{lbl}({pid})" for lbl, pid in results)
+            ),
+        )
+
+    def _on_remove_preset(self):
+        idx = self._selected_preset_index()
+        if idx is None:
+            return
+        preset = self.config.cfg.presets[idx]
+        if messagebox.askyesno("Remove", f"Remove preset '{preset.label}'?"):
+            self.config.remove(idx)
+            self._refresh_presets()
+
+    # ---- lifecycle -------------------------------------------------------
+
     def _open_account_manager(self):
-        AccountManager(self, self.store, on_change=self._refresh_accounts_dropdown)
+        AccountManager(self, self.store, on_change=lambda: (self._refresh_accounts_dropdown(), self._refresh_presets()))
 
     def _on_close(self):
         if self.manager.instances and not messagebox.askyesno(
@@ -192,7 +303,7 @@ class AccountManager(tk.Toplevel):
     def __init__(self, parent, store: AccountStore, on_change=None):
         super().__init__(parent)
         self.title("Accounts")
-        self.geometry("560x420")
+        self.geometry("580x440")
         self.transient(parent)
         self.store = store
         self.on_change = on_change
@@ -219,8 +330,8 @@ class AccountManager(tk.Toplevel):
         ttk.Button(btns, text="Remove Selected", command=self._on_remove).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Close", command=self.destroy).pack(side=tk.RIGHT, padx=4)
 
-        self.status_var = tk.StringVar(value="Paste the .ROBLOSECURITY cookie value (no _|WARNING wrapper needed; both forms are accepted).")
-        ttk.Label(self, textvariable=self.status_var, anchor=tk.W, padding=(10, 4), wraplength=540, justify=tk.LEFT).pack(fill=tk.X, side=tk.BOTTOM)
+        self.status_var = tk.StringVar(value="Paste the .ROBLOSECURITY cookie value (with or without the _|WARNING|_ wrapper).")
+        ttk.Label(self, textvariable=self.status_var, anchor=tk.W, padding=(10, 4), wraplength=560, justify=tk.LEFT).pack(fill=tk.X, side=tk.BOTTOM)
 
         self._refresh()
 
