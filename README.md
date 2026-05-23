@@ -90,6 +90,28 @@ pip install -r requirements.txt
 python main.py
 ```
 
+## Building a standalone .exe
+
+Run on a Windows machine — PyInstaller produces native binaries, so
+the build has to happen on the OS you're targeting. From the repo
+root:
+
+```powershell
+.\build.bat
+```
+
+This sets up a venv, installs `pyinstaller` plus the runtime deps,
+and produces `dist\MultiRobloxManager.exe` — a single-file `.exe` you
+can copy anywhere. No Python install required on the destination
+machine.
+
+The build uses `--onefile --windowed` (no console window) and pulls
+in `pywebview` + `psutil` via `--collect-all` so the
+browser-sign-in flow and the per-instance stats both work in the
+bundled exe. First launch unpacks to a temp dir so startup is a
+second or two slower than running from source — subsequent launches
+are normal speed once Windows caches the unpack.
+
 ## Adding accounts
 
 Two ways:

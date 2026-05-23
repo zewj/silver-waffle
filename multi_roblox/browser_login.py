@@ -41,11 +41,15 @@ def install_hint() -> str:
 
 def harvest_via_subprocess(timeout: float = 300.0) -> Optional[str]:
     """Open the login window in a child process; return the cookie or None."""
+    # When frozen by PyInstaller, sys.executable is the bundled .exe, not
+    # Python — `-m` won't work. Re-invoke our own entry point with the
+    # browser-login flag instead. main.py dispatches it to _run_webview.
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable, "--browser-login-harvest"]
+    else:
+        cmd = [sys.executable, "-m", "multi_roblox.browser_login", "--harvest"]
     try:
-        proc = subprocess.run(
-            [sys.executable, "-m", "multi_roblox.browser_login", "--harvest"],
-            capture_output=True, text=True, timeout=timeout,
-        )
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return None
     if proc.returncode != 0:

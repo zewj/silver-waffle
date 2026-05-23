@@ -6,3 +6,8 @@ venv/
 *.egg-info/
 .idea/
 .vscode/
+
+# PyInstaller artifacts
+build/
+dist/
+*.spec
