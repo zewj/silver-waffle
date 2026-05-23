@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from . import browser_login, launcher, logging_setup, servers
+from . import browser_login, launcher, logging_setup, servers, webhook
 from .accounts import AccountStore
 from .config import ConfigStore, Preset
 from .manager import InstanceManager
@@ -156,6 +156,9 @@ class MainWindow(QMainWindow):
     # Carries (result, error, on_done callback) from worker threads back to
     # the GUI thread. Qt makes the slot run on the main thread automatically.
     _async_done = Signal(object, object, object)
+    # Emitted by the manager's stats-poll thread when a PID dies. Connected
+    # to a slot below so the actual webhook POST runs on the GUI thread.
+    _crashed = Signal(object)
 
     def __init__(self):
         super().__init__()
@@ -171,6 +174,12 @@ class MainWindow(QMainWindow):
         self.manager = InstanceManager()
         self.manager.LAUNCH_COOLDOWN = self.config.cfg.launch_cooldown
         self.manager.launch_mode = self.config.cfg.launch_mode
+        # Fire-and-forget Discord webhook when an instance crashes. The
+        # manager calls this from its 2s stats poll thread, so the slot
+        # has to be thread-safe — emitting a queued signal is the simplest
+        # way to keep all webhook bookkeeping on the GUI thread.
+        self.manager.on_crash_callback = self._crashed.emit
+        self._crashed.connect(self._on_instance_crashed)
         self.manager.start()
 
         self.roblox_version = launcher.detect_version() or "unknown"
@@ -228,6 +237,11 @@ class MainWindow(QMainWindow):
         act_theme.setShortcut("Ctrl+T")
         act_theme.triggered.connect(self._on_toggle_theme)
         view_menu.addAction(act_theme)
+
+        settings_menu = bar.addMenu("&Settings")
+        act_webhook = QAction("Notifications…", self)
+        act_webhook.triggered.connect(self._open_webhook_settings)
+        settings_menu.addAction(act_webhook)
 
         help_menu = bar.addMenu("&Help")
         act_about = QAction("About", self)
@@ -705,6 +719,13 @@ class MainWindow(QMainWindow):
         except Exception:
             log.exception("stats refresh failed")
 
+    def _on_instance_crashed(self, inst):
+        """Slot for the _crashed signal. Runs on the GUI thread."""
+        self._toast(f"{inst.label} crashed", kind="error", duration_ms=4500)
+        cfg = self.config.cfg
+        if cfg.webhook_on_crash and cfg.webhook_url:
+            webhook.post_crash(cfg.webhook_url, inst)
+
     # ---- actions: launch / hop / focus / close ------------------------
 
     def _on_launch(self):
@@ -887,6 +908,10 @@ class MainWindow(QMainWindow):
     def _open_account_manager(self):
         dlg = AccountManagerDialog(self, self.store)
         dlg.account_changed.connect(self._on_accounts_changed)
+        dlg.exec()
+
+    def _open_webhook_settings(self):
+        dlg = WebhookSettingsDialog(self, self.config)
         dlg.exec()
 
     def _on_accounts_changed(self):
@@ -1116,6 +1141,130 @@ class AccountManagerDialog(QDialog):
         self.proxy_edit.clear()
         self.status_label.setText(f"Signed in as {acc.label()} (user {acc.user_id}).")
         self._refresh()
+
+
+# ---------------------------------------------------------------------------
+# Notifications dialog
+
+
+class WebhookSettingsDialog(QDialog):
+    """Configure the Discord webhook fired on instance crash."""
+
+    def __init__(self, parent: MainWindow, config: ConfigStore):
+        super().__init__(parent)
+        self.setWindowTitle("Notifications")
+        self.resize(560, 280)
+        self.config = config
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        title = QLabel("Discord notifications")
+        title.setObjectName("titleLabel")
+        layout.addWidget(title)
+
+        explainer = QLabel(
+            "Fires a Discord embed when any managed instance is detected to have "
+            "crashed (PID disappeared). To get a webhook URL: in Discord, "
+            "<i>Server Settings → Integrations → Webhooks → New Webhook</i>, "
+            "then <i>Copy Webhook URL</i>."
+        )
+        explainer.setObjectName("muted")
+        explainer.setWordWrap(True)
+        layout.addWidget(explainer)
+
+        box = QGroupBox("Webhook")
+        gl = QGridLayout(box)
+        gl.setContentsMargins(12, 18, 12, 12)
+        gl.setVerticalSpacing(8)
+        gl.setHorizontalSpacing(10)
+
+        gl.addWidget(QLabel("Webhook URL"), 0, 0)
+        self.url_edit = QLineEdit(self.config.cfg.webhook_url)
+        self.url_edit.setPlaceholderText("https://discord.com/api/webhooks/<id>/<token>")
+        gl.addWidget(self.url_edit, 0, 1)
+        gl.setColumnStretch(1, 1)
+
+        self.enable_radio_on = QRadioButton("Notify on crash")
+        self.enable_radio_off = QRadioButton("Disabled")
+        (self.enable_radio_on if self.config.cfg.webhook_on_crash
+         else self.enable_radio_off).setChecked(True)
+        radio_row = QHBoxLayout()
+        radio_row.addWidget(self.enable_radio_on)
+        radio_row.addWidget(self.enable_radio_off)
+        radio_row.addStretch(1)
+        wrap = QWidget()
+        wrap.setLayout(radio_row)
+        gl.addWidget(wrap, 1, 0, 1, 2)
+
+        layout.addWidget(box)
+
+        self.status_label = QLabel("")
+        self.status_label.setObjectName("muted")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        self.test_btn = QPushButton("Send Test")
+        self.test_btn.clicked.connect(self._on_test)
+        btn_row.addWidget(self.test_btn)
+        btn_row.addStretch(1)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        save_btn = QPushButton("Save")
+        save_btn.setObjectName("primaryButton")
+        save_btn.clicked.connect(self._on_save)
+        btn_row.addWidget(save_btn)
+        layout.addLayout(btn_row)
+
+        # Dark title bar to match the rest of the app.
+        QTimer.singleShot(
+            0, lambda: _apply_dark_title_bar(self, parent.config.cfg.theme == "dark"),
+        )
+
+    def _validated_url(self) -> Optional[str]:
+        try:
+            return webhook.validate_url(self.url_edit.text())
+        except ValueError as e:
+            self.status_label.setText(str(e))
+            return None
+
+    def _on_test(self):
+        url = self._validated_url()
+        if url is None:
+            return
+        if not url:
+            self.status_label.setText("Paste a webhook URL first.")
+            return
+        self.test_btn.setEnabled(False)
+        self.status_label.setText("Posting test notification…")
+        QApplication.processEvents()
+
+        # Run the network call on a worker thread so the UI doesn't hang
+        # while requests connects. Back to the GUI thread via QTimer.
+        def worker():
+            ok, msg = webhook.post_test_sync(url)
+            QTimer.singleShot(0, lambda: self._finish_test(ok, msg))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_test(self, ok: bool, msg: str):
+        self.test_btn.setEnabled(True)
+        if ok:
+            self.status_label.setText("Sent. Check the Discord channel.")
+        else:
+            self.status_label.setText(f"Failed: {msg}")
+
+    def _on_save(self):
+        url = self._validated_url()
+        if url is None:
+            return  # validation error already set on the status label
+        self.config.cfg.webhook_url = url
+        self.config.cfg.webhook_on_crash = self.enable_radio_on.isChecked()
+        self.config.save()
+        self.accept()
 
 
 # ---------------------------------------------------------------------------

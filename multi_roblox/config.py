@@ -31,6 +31,10 @@ class Config:
     launch_mode: str = "protocol"
     # UI theme: "dark" or "light".
     theme: str = "dark"
+    # Discord webhook URL fired when an instance crashes. Empty = disabled.
+    webhook_url: str = ""
+    # Master switch; even with a URL set, leaving this off mutes notifications.
+    webhook_on_crash: bool = True
 
     def _key(self, p: Preset):
         return (p.label, p.place_id, p.account_user_id)
@@ -77,6 +81,8 @@ class ConfigStore:
             launch_cooldown=float(data.get("launch_cooldown", 2.5)),
             launch_mode=mode,
             theme=theme,
+            webhook_url=str(data.get("webhook_url", "")),
+            webhook_on_crash=bool(data.get("webhook_on_crash", True)),
         )
 
     def save(self):
@@ -88,6 +94,8 @@ class ConfigStore:
                 "launch_cooldown": self.cfg.launch_cooldown,
                 "launch_mode": self.cfg.launch_mode,
                 "theme": self.cfg.theme,
+                "webhook_url": self.cfg.webhook_url,
+                "webhook_on_crash": self.cfg.webhook_on_crash,
             }, indent=2), encoding="utf-8")
             tmp.replace(self.path)
 

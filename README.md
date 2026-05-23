@@ -55,6 +55,11 @@ server hopping that doesn't trip the "you are joining too quickly" errors.
   there's an **Open Logs** button so you can grab it for bug reports.
 - **Roblox version awareness**: the detected client version is shown in
   the status bar and logged so you can correlate breakage with updates.
+- **Discord webhook on crash**: optional. Paste a webhook URL under
+  *Settings → Notifications…* and a Discord embed fires the moment the
+  manager detects an instance's PID went away — label, account, place,
+  jobId, timestamp. POST runs in a background thread so the GUI never
+  blocks. Built-in **Send Test** verifies the URL before you commit.
 - **Modern Qt UI**: built on PySide6. Dark / light theming via QSS,
   native DPI (no bitmap stretching on high-DPI monitors), window
   fade-in on startup, slide-and-fade toast notifications on
@@ -216,6 +221,7 @@ multi_roblox/
   servers.py         # Public server list, jobId picker, protocol URI builder
   stats.py           # psutil-based CPU/RAM/liveness sampling
   styles.py          # Dark and light Qt Style Sheets (Fluent-ish)
+  webhook.py         # Discord webhook posts on instance crash
   windows.py         # Win32 helpers: PID list, window find/focus, kill
 ```
 

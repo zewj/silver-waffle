@@ -61,6 +61,10 @@ class InstanceManager:
         # Default. The GUI overrides this from the persisted config.
         self.launch_mode = "protocol"
         self.instances: list[Instance] = []
+        # Optional callback fired exactly once when an instance transitions
+        # from running -> crashed. The GUI uses this to post the Discord
+        # webhook so the manager itself stays free of webhook config.
+        self.on_crash_callback = None
 
     def start(self):
         self._mutex.acquire()
@@ -256,3 +260,8 @@ class InstanceManager:
                 log.warning("instance %s (pid=%s) is no longer alive", inst.label, inst.pid)
                 inst.status = "crashed"
                 stats.forget(inst.pid)
+                if self.on_crash_callback is not None:
+                    try:
+                        self.on_crash_callback(inst)
+                    except Exception:
+                        log.exception("on_crash_callback raised for %s", inst.label)
