@@ -13,17 +13,21 @@ Per cycle (random 12–35 s) we:
     `F15` key — a "dead" function key almost no game binds — as a
     second signal for game builds that only watch keyboard input.
 
-The ticker **auto-pauses whenever the target window is the foreground
-window *and* the user has produced real input recently** (default: in
-the last 60 s). Two scenarios:
+Behavior depends on which "mode" the cycle falls into:
 
-  * Foreground + user active → skip. PvP / 1v1 safety: your real
-    clicks are already keeping Roblox awake, synthetic input would
-    only risk a misinput.
-  * Foreground + user idle for >60 s → tick. You're AFK in your own
-    window (got up, looking at your phone, whatever); Roblox's 20-min
-    kick is coming if we don't poke it. The synthetic input can't
-    clash with input you aren't generating.
+  * **Background** (target HWND isn't the foreground window) → tick
+    every cycle, normal 12–35 s cadence. This is the headline case:
+    Forza on top, Roblox behind, keep it alive.
+  * **Foreground + user active** (target HWND is foregrounded and the
+    user produced real input in the last 60 s) → skip. Real input is
+    already resetting Roblox's idle timer; synthetic input would only
+    risk a PvP / 1v1 misinput.
+  * **Foreground + user truly AFK** (target HWND is foregrounded but
+    no system input for >60 s) → slow-mode tick: send a full move +
+    keystroke at most once every `SLOW_TICK_INTERVAL_SEC` (default
+    15 min, well under Roblox's 20-min kick). The synthetic input
+    can't clash with input that isn't happening, but we also don't
+    spam — we send the bare minimum to stay alive.
 
 Each instance has its own `AntiAFK` thread; the thread sleeps almost
 all the time so dozens of them are still effectively zero-CPU.
@@ -69,9 +73,13 @@ KEYSTROKE_EVERY = 5
 
 # When the target window is foregrounded, treat the user as "really AFK"
 # (and therefore safe to tick) only after this many seconds of no system
-# keyboard / mouse activity. Well under Roblox's 20-min kick, so we'll
-# get multiple ticks in before it fires.
+# keyboard / mouse activity.
 USER_IDLE_THRESHOLD_SEC = 60.0
+
+# In the foreground-AFK case, cap the synthetic input rate. Roblox's
+# idle kick fires at ~20 min, so 15 min leaves a 5-min margin to ride
+# out a missed tick without risking the kick.
+SLOW_TICK_INTERVAL_SEC = 15 * 60
 
 
 def _make_lparam_coord(x: int, y: int) -> int:
@@ -107,6 +115,10 @@ class AntiAFK:
         self._interval_max = max(self._interval_min, float(interval_max))
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # Monotonic timestamp of the last synthetic input we sent. Used
+        # to throttle the slow-mode (foreground + user AFK) branch to
+        # one tick per SLOW_TICK_INTERVAL_SEC.
+        self._last_sent_monotonic = 0.0
 
     @property
     def running(self) -> bool:
@@ -130,23 +142,23 @@ class AntiAFK:
         self._stop.set()
         log.info("anti-AFK stop requested for %s", self._label)
 
-    def _resolve_hwnd(self) -> Optional[int]:
-        """Return the live HWND, or None if we should skip this cycle.
+    def _decide(self) -> tuple[Optional[int], bool]:
+        """Return (hwnd_to_tick_or_None, is_slow_mode_tick).
 
-        Skip when the target window is foregrounded *and* the user has
-        produced real input within `USER_IDLE_THRESHOLD_SEC`. If the
-        window's foregrounded but the user has been idle longer than
-        that, we tick anyway — they're AFK in their own window and
-        Roblox would kick them; the synthetic input can't collide with
-        input that isn't happening.
+        See the module docstring for the three states. `is_slow_mode_tick`
+        means we're in the foreground-AFK branch and should send a full
+        move + keystroke (since the next opportunity is 15 min away).
         """
         hwnd = self._lookup()
         if not hwnd or not windows._user32.IsWindow(hwnd):
-            return None
+            return None, False
         if windows._user32.GetForegroundWindow() == hwnd:
             if windows.system_idle_seconds() < USER_IDLE_THRESHOLD_SEC:
-                return None
-        return hwnd
+                return None, False
+            if time.monotonic() - self._last_sent_monotonic < SLOW_TICK_INTERVAL_SEC:
+                return None, False
+            return hwnd, True
+        return hwnd, False
 
     def _send_jitter(self, hwnd: int) -> None:
         center = _client_center(hwnd)
@@ -177,16 +189,18 @@ class AntiAFK:
         self._stop.wait(random.uniform(0.5, 3.0))
         cycle = 0
         while not self._stop.is_set():
-            hwnd = self._resolve_hwnd()
+            hwnd, slow = self._decide()
             if hwnd:
                 try:
                     self._send_jitter(hwnd)
-                    if cycle % KEYSTROKE_EVERY == 0:
+                    # Slow-mode ticks are sparse (~15 min apart) so always
+                    # pair the move with a keystroke. Background ticks
+                    # only fire the keystroke every Nth cycle.
+                    if slow or cycle % KEYSTROKE_EVERY == 0:
                         self._send_benign_keystroke(hwnd)
+                    self._last_sent_monotonic = time.monotonic()
                 except Exception:
                     log.exception("anti-AFK tick failed for %s", self._label)
-            else:
-                log.debug("anti-AFK %s: no live window this cycle", self._label)
             cycle += 1
             # Event-based sleep so stop() returns promptly.
             self._stop.wait(random.uniform(self._interval_min, self._interval_max))

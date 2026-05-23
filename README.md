@@ -56,12 +56,15 @@ server hopping that doesn't trip the "you are joining too quickly" errors.
   buttons. Activity (5–15 px mouse jitter around the client area center,
   plus an occasional `F15` keystroke — a dead function key no game binds)
   is `PostMessageW`-ed straight to the background Roblox HWND every
-  12–35 s with randomization. **Auto-pauses whenever the target window
-  is foregrounded *and* the user has produced real input in the last
-  60 s** — PvP / 1v1 safety so synthetic input can't clash with your
-  real clicks. If you're AFK in your own foregrounded Roblox window,
-  the ticker resumes (via `GetLastInputInfo`) so Roblox's 20-min kick
-  still doesn't fire. Each worker sleeps almost the entire interval,
+  12–35 s with randomization. Three modes based on the window/user
+  state: **background** (Roblox not foregrounded) ticks normally so
+  Forza-on-top stays kick-safe; **foreground + you're actively
+  playing** (real input within 60 s) skips entirely — PvP / 1v1 safety
+  so synthetic input can't clash with your clicks; **foreground +
+  you're truly AFK** (no system input for 60 s, checked via
+  `GetLastInputInfo`) slow-ticks at most once every 15 min — well
+  under Roblox's 20-min kick, but the absolute minimum input footprint
+  while you're away. Each worker sleeps almost the entire interval,
   so dozens of them idle at effectively zero CPU.
 - **Focus + cycle**: per-instance focus button, plus `Ctrl+Tab` to cycle.
   Uses `AttachThreadInput` + `SetForegroundWindow` to defeat focus-stealing
