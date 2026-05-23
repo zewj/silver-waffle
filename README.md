@@ -51,10 +51,12 @@ server hopping that doesn't trip the "you are joining too quickly" errors.
   there's an **Open Logs** button so you can grab it for bug reports.
 - **Roblox version awareness**: the detected client version is shown in
   the status bar and logged so you can correlate breakage with updates.
-- **Dark / light theme**: ships with a modern dark theme (Sun Valley via
-  `sv-ttk`) on by default; **Toggle Theme** in the toolbar flips it
-  and the choice persists. Title bars get the native Windows
-  `DwmSetWindowAttribute` dark mode applied so the chrome matches.
+- **Modern Qt UI**: built on PySide6. Dark / light theming via QSS,
+  native DPI (no bitmap stretching on high-DPI monitors), window
+  fade-in on startup, slide-and-fade toast notifications on
+  launch / hop / preset save, smooth hover states throughout, and a
+  `DwmSetWindowAttribute` dark title bar on Windows so chrome matches
+  the body. Toggle via **View → Toggle Dark / Light** (`Ctrl+T`).
 - **Per-instance Anti-AFK**: each row has an *Anti-AFK* column you can
   click to toggle, plus **Enable Anti-AFK on All** / **Disable on All**
   buttons. When a tick fires we `PostMessageW` a 5–15 px mouse jitter
@@ -201,7 +203,7 @@ multi_roblox/
   browser_login.py   # Embedded webview sign-in (password / QR / passkey)
   config.py          # Persistent presets / recent places / cooldown / mode
   dpapi.py           # CryptProtectData / CryptUnprotectData wrappers
-  gui.py             # Tkinter GUI
+  gui.py             # PySide6 GUI (MainWindow + AccountManagerDialog + Toast)
   launcher.py        # Find launcher + player exes; spawn with env overrides
   logging_setup.py   # Rotating log file + console handler
   manager.py         # InstanceManager — mutex, launch, focus, hop, stats
@@ -209,6 +211,7 @@ multi_roblox/
   profiles.py        # Per-account LOCALAPPDATA isolation (mklink /J)
   servers.py         # Public server list, jobId picker, protocol URI builder
   stats.py           # psutil-based CPU/RAM/liveness sampling
+  styles.py          # Dark and light Qt Style Sheets (Fluent-ish)
   windows.py         # Win32 helpers: PID list, window find/focus, kill
 ```
 

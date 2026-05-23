@@ -1,148 +1,166 @@
-"""Tkinter UI for the multi-instance manager."""
+"""PySide6 GUI for the multi-instance manager.
+
+Single window, Fluent-ish dark/light theming, in-place table updates so
+resize stays smooth, native DPI handling via Qt, plus a few real
+animations (window fade-in, toast notifications, status-bar flash on
+error). All the underlying logic — manager, accounts, antiafk, etc. —
+is framework-agnostic and unchanged.
+"""
+from __future__ import annotations
+
+import ctypes
 import logging
 import os
-import subprocess
+import sys
 import threading
 import time
-import tkinter as tk
-from tkinter import font as tkfont, messagebox, ttk
+from pathlib import Path
+from typing import Optional
 
-from . import browser_login, dpi, launcher, logging_setup, servers, theme
+from PySide6.QtCore import (
+    QEasingCurve, QPoint, QPropertyAnimation, QSize, Qt,
+    QTimer, Signal,
+)
+from PySide6.QtGui import QAction, QColor, QFont, QFontDatabase, QPalette
+from PySide6.QtWidgets import (
+    QAbstractItemView, QApplication, QComboBox, QDialog, QFormLayout,
+    QFrame, QGraphicsOpacityEffect, QGridLayout, QGroupBox, QHBoxLayout,
+    QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMenuBar,
+    QMessageBox, QPushButton, QRadioButton, QSizePolicy, QSpacerItem,
+    QSplitter, QStatusBar, QTextEdit, QToolButton, QTreeWidget,
+    QTreeWidgetItem, QVBoxLayout, QWidget,
+)
+
+from . import browser_login, launcher, logging_setup, servers
 from .accounts import AccountStore
 from .config import ConfigStore, Preset
 from .manager import InstanceManager
+from .styles import qss_for
 
 log = logging.getLogger(__name__)
 
 _NO_ACCOUNT = "(launcher's signed-in account)"
-# Stats poll cadence. Updates land in-place so this is cheap, but bumped from
-# 1500 to 2000ms anyway to free the event loop for resize / scroll work.
 _STATS_REFRESH_MS = 2000
-_AFK_COL_INDEX = "#6"  # 1-based Treeview column id for the Anti-AFK cell
 
-# Skip a stats refresh if a <Configure> event landed within this window — the
-# user is actively resizing and we don't want to compete with Tk's reflow.
-_RESIZE_QUIET_SEC = 0.20
-
-
-def _row_iid(inst) -> str:
-    """Stable Treeview iid for an instance. Lets us update cells in place
-    instead of clear-and-rebuild, which kills resize-time jank."""
-    return f"i{id(inst)}"
-
-# Unicode glyphs used as status/AFK indicators.
-_STATUS_GLYPH = {
-    "running":  "● running",
-    "starting": "◌ starting",
-    "crashed":  "✕ crashed",
-    "closed":   "■ closed",
-}
 _AFK_ON = "● on"
 _AFK_OFF = "○ off"
+_STATUS_GLYPH = {
+    "running": "● running",
+    "starting": "◌ starting",
+    "crashed": "✕ crashed",
+    "closed": "■ closed",
+}
+
+# Treeview column indices for the running-instances table.
+_COL_LABEL, _COL_ACCOUNT, _COL_PLACE, _COL_PID, _COL_STATUS, \
+    _COL_AFK, _COL_CPU, _COL_RAM, _COL_JOB = range(9)
 
 
-class _Tooltip:
-    """Lightweight tooltip for any ttk widget. Auto-hides on click / leave."""
+# ---------------------------------------------------------------------------
+# Windows-only chrome helpers
 
-    def __init__(self, widget: tk.Widget, text: str, delay_ms: int = 450):
-        self.widget = widget
-        self.text = text
-        self.delay_ms = delay_ms
-        self._after_id = None
-        self._tip: tk.Toplevel | None = None
-        widget.bind("<Enter>", self._schedule, add=True)
-        widget.bind("<Leave>", self._hide, add=True)
-        widget.bind("<ButtonPress>", self._hide, add=True)
 
-    def _schedule(self, _=None):
-        self._cancel()
-        self._after_id = self.widget.after(self.delay_ms, self._show)
+def _apply_dark_title_bar(window, dark: bool) -> None:
+    """Flip the OS-drawn title bar between dark and light on Windows.
 
-    def _cancel(self):
-        if self._after_id is not None:
+    Qt doesn't restyle the system title bar even when its content is dark;
+    `DwmSetWindowAttribute` is the supported way to do it. Tries the
+    Win11/20H1+ attribute (20) then the older Win10 1809 attribute (19).
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        hwnd = int(window.winId())
+        if not hwnd:
+            return
+        value = ctypes.c_int(1 if dark else 0)
+        dwmapi = ctypes.windll.dwmapi
+        for attr in (20, 19):
             try:
-                self.widget.after_cancel(self._after_id)
-            except Exception:
-                pass
-            self._after_id = None
-
-    def _show(self):
-        if self._tip is not None:
-            return
-        try:
-            x = self.widget.winfo_rootx() + self.widget.winfo_width() // 2
-            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
-        except Exception:
-            return
-        tw = tk.Toplevel(self.widget)
-        tw.wm_overrideredirect(True)
-        tw.wm_geometry(f"+{x}+{y}")
-        try:
-            tw.attributes("-topmost", True)
-            tw.attributes("-alpha", 0.0)
-        except Exception:
-            pass
-        ttk.Label(tw, text=self.text, padding=(8, 4), style="Tooltip.TLabel").pack()
-        self._tip = tw
-        # ~120ms fade in. Cheap; just attribute writes on a tiny toplevel.
-        self._fade(0.0)
-
-    def _fade(self, alpha: float):
-        if self._tip is None:
-            return
-        if alpha >= 0.95:
-            try:
-                self._tip.attributes("-alpha", 0.95)
-            except Exception:
-                pass
-            return
-        try:
-            self._tip.attributes("-alpha", alpha)
-        except Exception:
-            return
-        self._tip.after(16, lambda: self._fade(alpha + 0.16))
-
-    def _hide(self, _=None):
-        self._cancel()
-        if self._tip is not None:
-            try:
-                self._tip.destroy()
-            except Exception:
-                pass
-            self._tip = None
+                dwmapi.DwmSetWindowAttribute(
+                    hwnd, attr, ctypes.byref(value), ctypes.sizeof(value),
+                )
+            except OSError:
+                continue
+    except Exception:
+        log.exception("could not apply dark title bar")
 
 
-class App(tk.Tk):
-    def __init__(self, scale: float = 1.0):
+# ---------------------------------------------------------------------------
+# Toast notification
+
+
+class Toast(QFrame):
+    """Bottom-right slide-in toast. Fades out after `duration_ms`."""
+
+    def __init__(self, parent: QWidget, message: str, kind: str = "info",
+                 duration_ms: int = 2800):
+        super().__init__(parent)
+        self.setObjectName("toast")
+        self.setProperty("kind", kind)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(8)
+        label = QLabel(message)
+        label.setWordWrap(False)
+        layout.addWidget(label)
+
+        self._opacity = QGraphicsOpacityEffect(self)
+        self._opacity.setOpacity(0.0)
+        self.setGraphicsEffect(self._opacity)
+
+        self._duration_ms = duration_ms
+        self._fade_in = QPropertyAnimation(self._opacity, b"opacity", self)
+        self._fade_in.setDuration(180)
+        self._fade_in.setStartValue(0.0)
+        self._fade_in.setEndValue(1.0)
+        self._fade_in.setEasingCurve(QEasingCurve.OutCubic)
+
+        self._fade_out = QPropertyAnimation(self._opacity, b"opacity", self)
+        self._fade_out.setDuration(280)
+        self._fade_out.setStartValue(1.0)
+        self._fade_out.setEndValue(0.0)
+        self._fade_out.setEasingCurve(QEasingCurve.InCubic)
+        self._fade_out.finished.connect(self.deleteLater)
+
+    def show_at(self, anchor_bottom_right: QPoint):
+        self.adjustSize()
+        size = self.sizeHint()
+        x = anchor_bottom_right.x() - size.width() - 16
+        y = anchor_bottom_right.y() - size.height() - 16
+        # Slide up from 12 px below the final position.
+        self.move(QPoint(x, y + 12))
+        self.show()
+        self.raise_()
+        slide = QPropertyAnimation(self, b"pos", self)
+        slide.setDuration(220)
+        slide.setStartValue(QPoint(x, y + 12))
+        slide.setEndValue(QPoint(x, y))
+        slide.setEasingCurve(QEasingCurve.OutCubic)
+        slide.start(QPropertyAnimation.DeleteWhenStopped)
+        self._fade_in.start()
+        QTimer.singleShot(self._duration_ms, self._fade_out.start)
+
+
+# ---------------------------------------------------------------------------
+# Main window
+
+
+class MainWindow(QMainWindow):
+    # Carries (result, error, on_done callback) from worker threads back to
+    # the GUI thread. Qt makes the slot run on the main thread automatically.
+    _async_done = Signal(object, object, object)
+
+    def __init__(self):
         super().__init__()
-        self.scale_factor = scale
-        # Apply Tk's pixel-per-point scaling so widgets / fonts respect the
-        # monitor DPI. Has to happen before we set the window geometry so
-        # the initial size is correct.
-        dpi.apply_tk_scaling(self, scale)
-        self._setup_fonts()
-
-        self.title("Multi Roblox Manager")
-        # Base layout designed at 1080x700; scale up for high-DPI monitors.
-        w = int(1080 * scale)
-        h = int(700 * scale)
-        self.geometry(f"{w}x{h}")
-        self.minsize(int(940 * scale), int(560 * scale))
-
-        # Hide the window until first paint to avoid a flash of un-themed
-        # widgets while we wire everything up.
-        try:
-            self.attributes("-alpha", 0.0)
-        except Exception:
-            pass
+        self.setWindowTitle("Multi Roblox Manager")
+        self.resize(1120, 720)
+        self.setMinimumSize(960, 580)
 
         self.log_path = logging_setup.setup()
-        log.info("Multi Roblox Manager starting; log file at %s", self.log_path)
-
-        # Resize debounce: latest <Configure> timestamp on the root window.
-        # The stats refresher checks this and skips work while a drag is
-        # in flight so it doesn't compete with Tk's reflow.
-        self._last_configure = 0.0
+        log.info("Multi Roblox Manager (Qt) starting; log file at %s", self.log_path)
 
         self.store = AccountStore()
         self.config = ConfigStore()
@@ -154,459 +172,556 @@ class App(tk.Tk):
         self.roblox_version = launcher.detect_version() or "unknown"
         log.info("detected Roblox version: %s", self.roblox_version)
 
+        # Stable instance-id → QTreeWidgetItem cache so the periodic
+        # stats refresh updates rows in place instead of rebuilding the
+        # whole tree (eliminates resize-time stutter).
+        self._tree_items: dict[int, QTreeWidgetItem] = {}
+        self._preset_items: dict[int, QTreeWidgetItem] = {}
+
         self._build_menubar()
         self._build_ui()
+        self._async_done.connect(self._finish_async)
+
+        # Apply theme + paint the OS title bar.
         self._apply_theme(self.config.cfg.theme, persist=False)
+
         self._refresh_accounts_dropdown()
         self._refresh_presets()
         self._refresh_tree()
-        self._schedule_stats_refresh()
 
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.bind_all("<Control-Tab>", lambda _e: self._cycle())
-        self.bind_all("<Control-l>", lambda _e: self._focus_place_entry())
-        # Listen for root-level resize events so we can pause polling
-        # while the user is dragging the window edge.
-        self.bind("<Configure>", self._on_configure, add=True)
-        # Subtle fade in on first paint.
-        self.after(20, self._fade_in)
+        self._stats_timer = QTimer(self)
+        self._stats_timer.setInterval(_STATS_REFRESH_MS)
+        self._stats_timer.timeout.connect(self._on_stats_tick)
+        self._stats_timer.start()
 
-    def _setup_fonts(self):
-        """Make the named Tk fonts use Segoe UI at appropriately scaled sizes."""
-        try:
-            base_size = max(9, int(round(9 * self.scale_factor)))
-            for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
-                try:
-                    tkfont.nametofont(name).configure(family="Segoe UI", size=base_size)
-                except tk.TclError:
-                    continue
-            try:
-                tkfont.nametofont("TkFixedFont").configure(size=base_size)
-            except tk.TclError:
-                pass
-        except Exception:
-            log.exception("font setup failed")
+        # Subtle fade-in on first paint so the unstyled flash before QSS
+        # applies doesn't show through.
+        self.setWindowOpacity(0.0)
+        QTimer.singleShot(0, self._fade_in)
 
-    def _fade_in(self):
-        """Fade the main window in over ~150ms after the first paint."""
-        def step(alpha: float):
-            try:
-                if alpha >= 1.0:
-                    self.attributes("-alpha", 1.0)
-                    return
-                self.attributes("-alpha", alpha)
-            except Exception:
-                return
-            self.after(16, lambda: step(alpha + 0.12))
-        step(0.0)
-
-    def _on_configure(self, event):
-        if event.widget is self:
-            self._last_configure = time.monotonic()
-
-    # ---- layout ----------------------------------------------------------
+    # ---- menu / chrome ---------------------------------------------------
 
     def _build_menubar(self):
-        menubar = tk.Menu(self)
+        bar = self.menuBar()
 
-        file_menu = tk.Menu(menubar, tearoff=False)
-        file_menu.add_command(label="Open Logs Folder", command=self._open_logs)
-        file_menu.add_separator()
-        file_menu.add_command(label="Quit", command=self._on_close)
-        menubar.add_cascade(label="File", menu=file_menu)
+        file_menu = bar.addMenu("&File")
+        act_logs = QAction("Open Logs Folder", self)
+        act_logs.triggered.connect(self._open_logs)
+        file_menu.addAction(act_logs)
+        file_menu.addSeparator()
+        act_quit = QAction("Quit", self)
+        act_quit.setShortcut("Ctrl+Q")
+        act_quit.triggered.connect(self.close)
+        file_menu.addAction(act_quit)
 
-        accounts_menu = tk.Menu(menubar, tearoff=False)
-        accounts_menu.add_command(label="Manage Accounts…", command=self._open_account_manager)
-        menubar.add_cascade(label="Accounts", menu=accounts_menu)
+        accounts_menu = bar.addMenu("&Accounts")
+        act_acc = QAction("Manage Accounts…", self)
+        act_acc.triggered.connect(self._open_account_manager)
+        accounts_menu.addAction(act_acc)
 
-        view_menu = tk.Menu(menubar, tearoff=False)
-        view_menu.add_command(label="Toggle Dark / Light", command=self._on_toggle_theme)
-        menubar.add_cascade(label="View", menu=view_menu)
+        view_menu = bar.addMenu("&View")
+        act_theme = QAction("Toggle Dark / Light", self)
+        act_theme.setShortcut("Ctrl+T")
+        act_theme.triggered.connect(self._on_toggle_theme)
+        view_menu.addAction(act_theme)
 
-        help_menu = tk.Menu(menubar, tearoff=False)
-        help_menu.add_command(label="About", command=self._show_about)
-        menubar.add_cascade(label="Help", menu=help_menu)
-
-        self["menu"] = menubar
+        help_menu = bar.addMenu("&Help")
+        act_about = QAction("About", self)
+        act_about.triggered.connect(self._show_about)
+        help_menu.addAction(act_about)
 
     def _build_ui(self):
-        # ---- header strip (title + detected version + spacer) ----
-        header = ttk.Frame(self, padding=(14, 10, 14, 4))
-        header.pack(fill=tk.X)
-        title = ttk.Label(header, text="Multi Roblox Manager",
-                          font=("Segoe UI", 14, "bold"))
-        title.pack(side=tk.LEFT)
-        self.header_meta_var = tk.StringVar(value=f"Roblox {self.roblox_version}")
-        ttk.Label(header, textvariable=self.header_meta_var,
-                  foreground="#7a7a7a").pack(side=tk.LEFT, padx=(12, 0))
+        central = QWidget()
+        central.setObjectName("central")
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(14, 10, 14, 4)
+        root.setSpacing(8)
 
-        # ---- Launch card ----
-        launch = ttk.LabelFrame(self, text="Launch", padding=12)
-        launch.pack(fill=tk.X, padx=14, pady=(4, 6))
+        # ---- header strip ----
+        header = QFrame()
+        header.setObjectName("headerFrame")
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(2, 0, 2, 0)
+        hl.setSpacing(12)
+        title = QLabel("Multi Roblox Manager")
+        title.setObjectName("titleLabel")
+        hl.addWidget(title)
+        self.meta_label = QLabel(f"Roblox {self.roblox_version}")
+        self.meta_label.setObjectName("metaLabel")
+        hl.addWidget(self.meta_label)
+        hl.addStretch(1)
+        root.addWidget(header)
 
-        ttk.Label(launch, text="Game").grid(row=0, column=0, sticky=tk.W, padx=(0, 8), pady=(0, 4))
-        self.place_var = tk.StringVar()
-        self.place_entry = ttk.Entry(launch, textvariable=self.place_var)
-        self.place_entry.grid(row=0, column=1, sticky=tk.EW, padx=(0, 12), pady=(0, 4))
-        _Tooltip(self.place_entry,
-                 "placeId (e.g. 920587237) or a roblox.com /games/<id>/… URL")
+        # ---- launch card ----
+        root.addWidget(self._build_launch_card())
 
-        ttk.Label(launch, text="Account").grid(row=0, column=2, sticky=tk.W, padx=(0, 8), pady=(0, 4))
-        self.account_var = tk.StringVar()
-        self.account_combo = ttk.Combobox(launch, textvariable=self.account_var,
-                                          width=24, state="readonly")
-        self.account_combo.grid(row=0, column=3, sticky=tk.EW, pady=(0, 4))
+        # ---- body splitter ----
+        self.body = QSplitter(Qt.Horizontal)
+        self.body.setHandleWidth(6)
+        self.body.setChildrenCollapsible(False)
+        root.addWidget(self.body, 1)
+        self.body.addWidget(self._build_running_pane())
+        self.body.addWidget(self._build_presets_pane())
+        self.body.setStretchFactor(0, 3)
+        self.body.setStretchFactor(1, 2)
 
-        ttk.Label(launch, text="Label").grid(row=1, column=0, sticky=tk.W, padx=(0, 8))
-        self.label_var = tk.StringVar()
-        self.label_entry = ttk.Entry(launch, textvariable=self.label_var)
-        self.label_entry.grid(row=1, column=1, sticky=tk.EW, padx=(0, 12))
+        # ---- action bar ----
+        root.addWidget(self._build_action_bar())
 
-        action_btns = ttk.Frame(launch)
-        action_btns.grid(row=1, column=2, columnspan=2, sticky=tk.W)
-        launch_btn = ttk.Button(action_btns, text="Launch", command=self._on_launch, width=12)
-        launch_btn.pack(side=tk.LEFT, padx=(0, 6))
-        _Tooltip(launch_btn, "Launch a new Roblox instance (Enter in any launch field)")
-        save_btn = ttk.Button(action_btns, text="Save as Preset", command=self._on_save_preset, width=14)
-        save_btn.pack(side=tk.LEFT)
-        _Tooltip(save_btn, "Remember this label/place/account combo across restarts")
-
-        mode_row = ttk.Frame(launch)
-        mode_row.grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=(10, 0))
-        ttk.Label(mode_row, text="Launch via:").pack(side=tk.LEFT)
-        self.mode_var = tk.StringVar(value=self.config.cfg.launch_mode)
-        proto_radio = ttk.Radiobutton(
-            mode_row, text="Roblox launcher (recommended)",
-            variable=self.mode_var, value="protocol",
-            command=self._on_mode_changed,
+        # ---- status bar ----
+        sb = QStatusBar()
+        self.setStatusBar(sb)
+        self._status_label = QLabel(
+            f"Ready • Roblox {self.roblox_version} • mutex held • "
+            "per-account ticket auth & profile isolation enabled"
         )
-        proto_radio.pack(side=tk.LEFT, padx=(10, 0))
-        _Tooltip(proto_radio,
-                 "Goes through RobloxPlayerLauncher.exe — stable, handles updates, Hyperion-friendly")
-        direct_radio = ttk.Radiobutton(
-            mode_row, text="Direct (skip launcher)",
-            variable=self.mode_var, value="direct",
-            command=self._on_mode_changed,
+        sb.addWidget(self._status_label, 1)
+
+    def _build_launch_card(self) -> QGroupBox:
+        card = QGroupBox("Launch")
+        grid = QGridLayout(card)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+        grid.setContentsMargins(12, 18, 12, 12)
+
+        # Row 0: Game | Account
+        grid.addWidget(QLabel("Game"), 0, 0)
+        self.place_edit = QLineEdit()
+        self.place_edit.setPlaceholderText("placeId or roblox.com/games/<id>/… URL")
+        self.place_edit.setToolTip(
+            "Numeric placeId (e.g. 920587237) or a roblox.com /games/<id>/… URL"
         )
-        direct_radio.pack(side=tk.LEFT, padx=(10, 0))
-        _Tooltip(direct_radio,
-                 "Spawns RobloxPlayerBeta.exe directly — faster start, skips update check")
+        self.place_edit.returnPressed.connect(self._on_launch)
+        grid.addWidget(self.place_edit, 0, 1)
 
-        launch.columnconfigure(1, weight=2)
-        launch.columnconfigure(3, weight=1)
+        grid.addWidget(QLabel("Account"), 0, 2)
+        self.account_combo = QComboBox()
+        self.account_combo.setMinimumWidth(220)
+        grid.addWidget(self.account_combo, 0, 3)
 
-        # ---- Body: running instances | saved presets ----
-        body = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
-        body.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 4))
+        # Row 1: Label | buttons
+        grid.addWidget(QLabel("Label"), 1, 0)
+        self.label_edit = QLineEdit()
+        self.label_edit.setPlaceholderText("optional")
+        self.label_edit.returnPressed.connect(self._on_launch)
+        grid.addWidget(self.label_edit, 1, 1)
 
-        live_frame = ttk.LabelFrame(body, text="Running instances", padding=8)
-        body.add(live_frame, weight=3)
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        self.launch_btn = QPushButton("Launch")
+        self.launch_btn.setObjectName("primaryButton")
+        self.launch_btn.clicked.connect(self._on_launch)
+        self.launch_btn.setShortcut("Ctrl+Return")
+        self.launch_btn.setToolTip("Launch a new Roblox instance (Ctrl+Enter)")
+        btn_row.addWidget(self.launch_btn)
+        save_btn = QPushButton("Save Preset")
+        save_btn.clicked.connect(self._on_save_preset)
+        save_btn.setToolTip("Remember this label/place/account combo across restarts")
+        btn_row.addWidget(save_btn)
+        btn_row.addStretch(1)
+        wrap = QWidget()
+        wrap.setLayout(btn_row)
+        grid.addWidget(wrap, 1, 2, 1, 2)
 
-        tree_wrap = ttk.Frame(live_frame)
-        tree_wrap.pack(fill=tk.BOTH, expand=True)
-        cols = ("label", "account", "place", "pid", "status", "afk", "cpu", "ram", "job")
-        self.tree = ttk.Treeview(tree_wrap, columns=cols, show="headings",
-                                 selectmode="extended")
-        for col, head, w, anchor in (
-            ("label",   "Label",         120, tk.W),
-            ("account", "Account",       140, tk.W),
-            ("place",   "Place",          90, tk.W),
-            ("pid",     "PID",            60, tk.W),
-            ("status",  "Status",        100, tk.W),
-            ("afk",     "Anti-AFK",       80, tk.CENTER),
-            ("cpu",     "CPU %",          60, tk.E),
-            ("ram",     "RAM MB",         70, tk.E),
-            ("job",     "Server (jobId)", 220, tk.W),
-        ):
-            self.tree.heading(col, text=head)
-            self.tree.column(col, width=w, anchor=anchor)
-        tree_scroll = ttk.Scrollbar(tree_wrap, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=tree_scroll.set)
-        self.tree.grid(row=0, column=0, sticky=tk.NSEW)
-        tree_scroll.grid(row=0, column=1, sticky=tk.NS)
-        tree_wrap.rowconfigure(0, weight=1)
-        tree_wrap.columnconfigure(0, weight=1)
-
-        # Empty-state hint, overlaid on the tree when nothing's running.
-        self.empty_state = ttk.Label(
-            tree_wrap,
-            text=("No instances running.\n\n"
-                  "Paste a placeId or game URL above, pick an account, click Launch."),
-            anchor="center", justify="center",
-            font=("Segoe UI", 10, "italic"),
-            foreground="#7a7a7a",
+        # Row 2: launch mode
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(14)
+        mode_row.addWidget(QLabel("Launch via:"))
+        self.proto_radio = QRadioButton("Roblox launcher (recommended)")
+        self.proto_radio.setToolTip(
+            "Goes through RobloxPlayerLauncher.exe — stable, handles updates, "
+            "Hyperion-friendly"
         )
-
-        live_hint = ttk.Label(
-            live_frame,
-            text="Ctrl/Shift-click for multi-select • Click the Anti-AFK cell to toggle that row",
-            foreground="#7a7a7a", font=("Segoe UI", 9),
+        self.direct_radio = QRadioButton("Direct (skip launcher)")
+        self.direct_radio.setToolTip(
+            "Spawns RobloxPlayerBeta.exe directly — faster start, skips update check"
         )
-        live_hint.pack(fill=tk.X, pady=(6, 0))
-
-        self.tree.bind("<Button-1>", self._on_tree_click)
-
-        # Presets pane (now a Treeview for consistency).
-        preset_frame = ttk.LabelFrame(body, text="Saved presets", padding=8)
-        body.add(preset_frame, weight=2)
-
-        preset_wrap = ttk.Frame(preset_frame)
-        preset_wrap.pack(fill=tk.BOTH, expand=True)
-        self.preset_tree = ttk.Treeview(
-            preset_wrap,
-            columns=("label", "place", "account"),
-            show="headings", selectmode="browse",
+        (self.proto_radio if self.config.cfg.launch_mode == "protocol"
+         else self.direct_radio).setChecked(True)
+        self.proto_radio.toggled.connect(
+            lambda checked: checked and self._on_mode_changed("protocol")
         )
-        for col, head, w in (
-            ("label", "Label", 130),
-            ("place", "Place", 90),
-            ("account", "Account", 130),
-        ):
-            self.preset_tree.heading(col, text=head)
-            self.preset_tree.column(col, width=w, anchor=tk.W)
-        preset_scroll = ttk.Scrollbar(preset_wrap, orient=tk.VERTICAL, command=self.preset_tree.yview)
-        self.preset_tree.configure(yscrollcommand=preset_scroll.set)
-        self.preset_tree.grid(row=0, column=0, sticky=tk.NSEW)
-        preset_scroll.grid(row=0, column=1, sticky=tk.NS)
-        preset_wrap.rowconfigure(0, weight=1)
-        preset_wrap.columnconfigure(0, weight=1)
-        self.preset_tree.bind("<Double-1>", lambda _e: self._on_launch_preset())
+        self.direct_radio.toggled.connect(
+            lambda checked: checked and self._on_mode_changed("direct")
+        )
+        mode_row.addWidget(self.proto_radio)
+        mode_row.addWidget(self.direct_radio)
+        mode_row.addStretch(1)
+        mode_wrap = QWidget()
+        mode_wrap.setLayout(mode_row)
+        grid.addWidget(mode_wrap, 2, 0, 1, 4)
 
-        preset_btns = ttk.Frame(preset_frame)
-        preset_btns.pack(fill=tk.X, pady=(8, 0))
-        ttk.Button(preset_btns, text="Launch", command=self._on_launch_preset).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(preset_btns, text="Launch All", command=self._on_launch_all_presets).pack(side=tk.LEFT, padx=4)
-        ttk.Button(preset_btns, text="Remove", command=self._on_remove_preset).pack(side=tk.LEFT, padx=4)
+        grid.setColumnStretch(1, 2)
+        grid.setColumnStretch(3, 1)
+        return card
 
-        # ---- Grouped action bar ----
-        bar = ttk.Frame(self, padding=(14, 6, 14, 6))
-        bar.pack(fill=tk.X)
+    def _build_running_pane(self) -> QWidget:
+        box = QGroupBox("Running instances")
+        wrap = QVBoxLayout(box)
+        wrap.setContentsMargins(10, 18, 10, 10)
+        wrap.setSpacing(6)
 
-        def _sep():
-            ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(9)
+        self.tree.setHeaderLabels([
+            "Label", "Account", "Place", "PID", "Status",
+            "Anti-AFK", "CPU %", "RAM MB", "Server (jobId)",
+        ])
+        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setRootIsDecorated(False)
+        self.tree.setUniformRowHeights(True)
+        header = self.tree.header()
+        header.setStretchLastSection(True)
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        widths = [130, 140, 90, 60, 100, 90, 70, 80, 220]
+        for i, w in enumerate(widths):
+            self.tree.setColumnWidth(i, w)
+        self.tree.itemClicked.connect(self._on_tree_item_clicked)
+        wrap.addWidget(self.tree, 1)
 
-        win_group = ttk.Frame(bar)
-        win_group.pack(side=tk.LEFT)
-        ttk.Label(win_group, text="Window", foreground="#7a7a7a", font=("Segoe UI", 9)).pack(anchor=tk.W)
-        win_btns = ttk.Frame(win_group)
-        win_btns.pack()
-        ttk.Button(win_btns, text="Focus", command=self._on_focus, width=8).pack(side=tk.LEFT, padx=2)
-        cycle_btn = ttk.Button(win_btns, text="Cycle", command=self._cycle, width=8)
-        cycle_btn.pack(side=tk.LEFT, padx=2)
-        _Tooltip(cycle_btn, "Rotate focus to the next running instance (Ctrl+Tab)")
+        # Empty-state overlay, shown when no instances are running.
+        self.empty_state = QLabel(
+            "No instances running.\n\n"
+            "Paste a placeId or game URL above, pick an account, click Launch."
+        )
+        self.empty_state.setObjectName("emptyState")
+        self.empty_state.setAlignment(Qt.AlignCenter)
+        self.empty_state.setParent(self.tree.viewport())
+        self.empty_state.hide()
+        # Reposition the overlay when the tree resizes.
+        self.tree.viewport().installEventFilter(self)
 
-        _sep()
+        hint = QLabel(
+            "Ctrl/Shift-click for multi-select • "
+            "Click the Anti-AFK cell to toggle that row"
+        )
+        hint.setObjectName("hintLabel")
+        wrap.addWidget(hint)
+        return box
 
-        srv_group = ttk.Frame(bar)
-        srv_group.pack(side=tk.LEFT)
-        ttk.Label(srv_group, text="Server", foreground="#7a7a7a", font=("Segoe UI", 9)).pack(anchor=tk.W)
-        srv_btns = ttk.Frame(srv_group)
-        srv_btns.pack()
-        hop_btn = ttk.Button(srv_btns, text="Hop", command=self._on_hop, width=10)
-        hop_btn.pack(side=tk.LEFT, padx=2)
-        _Tooltip(hop_btn,
-                 "Pick a fresh public server and hop the selected instance(s) "
-                 "without the close-and-reopen flash")
+    def _build_presets_pane(self) -> QWidget:
+        box = QGroupBox("Saved presets")
+        wrap = QVBoxLayout(box)
+        wrap.setContentsMargins(10, 18, 10, 10)
+        wrap.setSpacing(8)
 
-        _sep()
+        self.preset_tree = QTreeWidget()
+        self.preset_tree.setColumnCount(3)
+        self.preset_tree.setHeaderLabels(["Label", "Place", "Account"])
+        self.preset_tree.setRootIsDecorated(False)
+        self.preset_tree.setAlternatingRowColors(True)
+        self.preset_tree.setUniformRowHeights(True)
+        self.preset_tree.header().setStretchLastSection(True)
+        for i, w in enumerate((130, 90, 130)):
+            self.preset_tree.setColumnWidth(i, w)
+        self.preset_tree.itemDoubleClicked.connect(lambda _i, _c: self._on_launch_preset())
+        wrap.addWidget(self.preset_tree, 1)
 
-        afk_group = ttk.Frame(bar)
-        afk_group.pack(side=tk.LEFT)
-        ttk.Label(afk_group, text="Anti-AFK", foreground="#7a7a7a", font=("Segoe UI", 9)).pack(anchor=tk.W)
-        afk_btns = ttk.Frame(afk_group)
-        afk_btns.pack()
-        toggle_afk = ttk.Button(afk_btns, text="Toggle", command=self._on_toggle_antiafk, width=8)
-        toggle_afk.pack(side=tk.LEFT, padx=2)
-        _Tooltip(toggle_afk, "Toggle Anti-AFK on the selected instance(s)")
-        ttk.Button(afk_btns, text="Enable All",
-                   command=lambda: self._on_set_antiafk_all(True), width=10).pack(side=tk.LEFT, padx=2)
-        ttk.Button(afk_btns, text="Disable All",
-                   command=lambda: self._on_set_antiafk_all(False), width=10).pack(side=tk.LEFT, padx=2)
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        b1 = QPushButton("Launch")
+        b1.clicked.connect(self._on_launch_preset)
+        b2 = QPushButton("Launch All")
+        b2.clicked.connect(self._on_launch_all_presets)
+        b3 = QPushButton("Remove")
+        b3.clicked.connect(self._on_remove_preset)
+        row.addWidget(b1)
+        row.addWidget(b2)
+        row.addWidget(b3)
+        row.addStretch(1)
+        wrap.addLayout(row)
+        return box
 
-        _sep()
+    def _build_action_bar(self) -> QWidget:
+        wrap = QFrame()
+        wrap.setObjectName("actionBar")
+        layout = QHBoxLayout(wrap)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(10)
 
-        inst_group = ttk.Frame(bar)
-        inst_group.pack(side=tk.LEFT)
-        ttk.Label(inst_group, text="Instance", foreground="#7a7a7a", font=("Segoe UI", 9)).pack(anchor=tk.W)
-        close_btn = ttk.Button(inst_group, text="Close", command=self._on_close_instance, width=8)
-        close_btn.pack(padx=2)
-        _Tooltip(close_btn, "Terminate the selected instance(s)")
+        def make_group(caption: str, *buttons: QPushButton) -> QWidget:
+            box = QWidget()
+            v = QVBoxLayout(box)
+            v.setContentsMargins(0, 0, 0, 0)
+            v.setSpacing(2)
+            cap = QLabel(caption)
+            cap.setObjectName("groupCaption")
+            v.addWidget(cap)
+            h = QHBoxLayout()
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(4)
+            for b in buttons:
+                h.addWidget(b)
+            v.addLayout(h)
+            return box
 
-        # ---- Status footer ----
-        self.status_var = tk.StringVar(value=(
-            f"Ready • {self.roblox_version} • mutex held • per-account ticket auth & profile isolation enabled"
-        ))
-        ttk.Label(self, textvariable=self.status_var, anchor=tk.W,
-                  padding=(14, 6)).pack(fill=tk.X, side=tk.BOTTOM)
+        def sep() -> QFrame:
+            line = QFrame()
+            line.setFrameShape(QFrame.VLine)
+            line.setFrameShadow(QFrame.Plain)
+            line.setStyleSheet("color: #3a3a3a;")
+            return line
 
-    # ---- helpers ---------------------------------------------------------
+        focus_btn = QPushButton("Focus")
+        focus_btn.clicked.connect(self._on_focus)
+        cycle_btn = QPushButton("Cycle")
+        cycle_btn.setShortcut("Ctrl+Tab")
+        cycle_btn.setToolTip("Rotate focus to the next running instance (Ctrl+Tab)")
+        cycle_btn.clicked.connect(self._cycle)
+        layout.addWidget(make_group("WINDOW", focus_btn, cycle_btn))
 
-    def _focus_place_entry(self):
-        try:
-            self.place_entry.focus_set()
-            self.place_entry.select_range(0, tk.END)
-        except Exception:
-            pass
+        layout.addWidget(sep())
 
-    def _refresh_accounts_dropdown(self):
-        labels = [_NO_ACCOUNT] + [a.label() for a in self.store]
-        self.account_combo["values"] = labels
-        if self.account_var.get() not in labels:
-            self.account_var.set(labels[0])
+        hop_btn = QPushButton("Hop")
+        hop_btn.setToolTip(
+            "Pick a fresh public server and hop the selected instance(s) "
+            "without the close-and-reopen flash"
+        )
+        hop_btn.clicked.connect(self._on_hop)
+        layout.addWidget(make_group("SERVER", hop_btn))
 
-    def _refresh_presets(self):
-        self.preset_tree.delete(*self.preset_tree.get_children())
-        for p in self.config.cfg.presets:
-            account = self.store.find(p.account_user_id) if p.account_user_id else None
-            acc_label = account.label() if account else (
-                "[missing account]" if p.account_user_id else "(signed-in)"
-            )
-            self.preset_tree.insert("", tk.END, values=(p.label, p.place_id, acc_label))
+        layout.addWidget(sep())
 
-    def _resolve_selected_account(self):
-        choice = self.account_var.get()
-        if not choice or choice == _NO_ACCOUNT:
-            return None
-        return next((a for a in self.store if a.label() == choice), None)
+        afk_toggle = QPushButton("Toggle")
+        afk_toggle.setToolTip("Toggle Anti-AFK on the selected instance(s)")
+        afk_toggle.clicked.connect(self._on_toggle_antiafk)
+        afk_on = QPushButton("Enable All")
+        afk_on.clicked.connect(lambda: self._on_set_antiafk_all(True))
+        afk_off = QPushButton("Disable All")
+        afk_off.clicked.connect(lambda: self._on_set_antiafk_all(False))
+        layout.addWidget(make_group("ANTI-AFK", afk_toggle, afk_on, afk_off))
 
-    def _selected_instances(self):
-        out = []
-        by_iid = {_row_iid(inst): inst for inst in self.manager.instances}
-        for iid in self.tree.selection():
-            inst = by_iid.get(iid)
-            if inst is not None:
-                out.append(inst)
-        return out
+        layout.addWidget(sep())
 
-    def _selected_instance(self):
-        sel = self._selected_instances()
-        return sel[0] if sel else None
+        close_btn = QPushButton("Close")
+        close_btn.setToolTip("Terminate the selected instance(s)")
+        close_btn.clicked.connect(self._on_close_instance)
+        layout.addWidget(make_group("INSTANCE", close_btn))
 
-    def _refresh_tree(self):
-        # Update existing rows in place and only delete rows for instances
-        # that no longer exist. Rebuilding the whole Treeview every poll is
-        # what made resizing feel laggy.
-        wanted_iids: set[str] = set()
-        for inst in self.manager.instances:
-            iid = _row_iid(inst)
-            wanted_iids.add(iid)
-            s = inst.last_sample
-            values = (
-                inst.label,
-                inst.account.label() if inst.account else _NO_ACCOUNT,
-                inst.place_id,
-                inst.pid or "—",
-                _STATUS_GLYPH.get(inst.status, inst.status),
-                _AFK_ON if inst.antiafk_on else _AFK_OFF,
-                f"{s.cpu_percent:.0f}" if s.alive else "—",
-                f"{s.rss_mb:.0f}" if s.alive else "—",
-                inst.job_id or "—",
-            )
-            tags = ("crashed",) if inst.status == "crashed" else ()
-            if self.tree.exists(iid):
-                self.tree.item(iid, values=values, tags=tags)
-            else:
-                self.tree.insert("", tk.END, iid=iid, values=values, tags=tags)
+        layout.addStretch(1)
+        return wrap
 
-        for child in self.tree.get_children():
-            if child not in wanted_iids:
-                self.tree.delete(child)
-
-        if not self.manager.instances:
-            self.empty_state.place(relx=0.5, rely=0.5, anchor="center")
-        else:
-            self.empty_state.place_forget()
-
-    def _schedule_stats_refresh(self):
-        # Don't fight Tk's reflow while a resize is happening.
-        if time.monotonic() - self._last_configure > _RESIZE_QUIET_SEC:
-            try:
-                self.manager.refresh_stats()
-                self._refresh_tree()
-            except Exception:
-                log.exception("stats refresh failed")
-        self.after(_STATS_REFRESH_MS, self._schedule_stats_refresh)
+    # ---- theming ---------------------------------------------------------
 
     def _apply_theme(self, requested: str, persist: bool = True) -> None:
-        # Both tree views and the LabelFrames are ttk widgets, so sv-ttk
-        # handles them. No native widgets to recolor any more (preset
-        # Listbox was replaced by a Treeview in this UI pass).
-        applied = theme.apply(self, requested, native_widgets=None)
-        self.tree.tag_configure("crashed", foreground=theme.crashed_fg(applied))
+        theme = requested if requested in ("dark", "light") else "dark"
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(qss_for(theme))
+        _apply_dark_title_bar(self, dark=(theme == "dark"))
         if persist:
-            self.config.cfg.theme = applied
+            self.config.cfg.theme = theme
             self.config.save()
+        log.info("theme applied: %s", theme)
 
     def _on_toggle_theme(self):
-        if not theme.is_available():
-            messagebox.showinfo(
-                "Theme",
-                "Dark mode needs sv-ttk. Install with:\n  pip install sv-ttk",
-            )
-            return
         new = "light" if self.config.cfg.theme == "dark" else "dark"
         self._apply_theme(new)
         self._set_status(f"Theme: {new}.")
 
-    def _open_logs(self):
-        try:
-            os.startfile(str(self.log_path.parent))
-        except Exception as e:
-            log.exception("could not open log folder")
-            messagebox.showerror("Logs", f"Could not open {self.log_path.parent}: {e}")
+    # ---- fade in ---------------------------------------------------------
 
-    def _show_about(self):
-        messagebox.showinfo(
-            "About Multi Roblox Manager",
-            "Multi Roblox Manager\n\n"
-            f"Roblox client detected: {self.roblox_version}\n"
-            f"Log folder: {self.log_path.parent}\n\n"
-            "Holds the Roblox singleton mutex so multiple clients can run, "
-            "with per-account ticket auth, profile isolation, server hop, and Anti-AFK.",
-        )
+    def _fade_in(self):
+        anim = QPropertyAnimation(self, b"windowOpacity", self)
+        anim.setDuration(220)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        anim.start(QPropertyAnimation.DeleteWhenStopped)
 
-    def _set_status(self, msg):
-        self.status_var.set(msg)
+    # ---- helpers ---------------------------------------------------------
+
+    def _set_status(self, msg: str, kind: str = "info"):
+        self._status_label.setText(msg)
+        if kind == "error":
+            self._toast(msg, kind="error", duration_ms=4500)
+
+    def _toast(self, message: str, kind: str = "info", duration_ms: int = 2800):
+        toast = Toast(self, message, kind=kind, duration_ms=duration_ms)
+        # Anchor to the bottom-right of the central widget.
+        anchor = self.mapToGlobal(QPoint(self.width(), self.height() - self.statusBar().height()))
+        anchor = self.mapFromGlobal(anchor)
+        toast.show_at(anchor)
+
+    def _refresh_accounts_dropdown(self):
+        current = self.account_combo.currentText()
+        self.account_combo.blockSignals(True)
+        self.account_combo.clear()
+        self.account_combo.addItem(_NO_ACCOUNT)
+        for acc in self.store:
+            self.account_combo.addItem(acc.label())
+        idx = self.account_combo.findText(current)
+        self.account_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.account_combo.blockSignals(False)
+
+    def _resolve_selected_account(self):
+        choice = self.account_combo.currentText()
+        if not choice or choice == _NO_ACCOUNT:
+            return None
+        return next((a for a in self.store if a.label() == choice), None)
+
+    # ---- running-instances tree ----------------------------------------
+
+    def _selected_instances(self):
+        out = []
+        wanted = {id(i): i for i in self.manager.instances}
+        for item in self.tree.selectedItems():
+            inst_id = item.data(0, Qt.UserRole)
+            inst = wanted.get(inst_id)
+            if inst is not None:
+                out.append(inst)
+        return out
+
+    def _refresh_tree(self):
+        wanted: dict[int, "Instance"] = {id(i): i for i in self.manager.instances}
+
+        # Remove rows for instances that no longer exist.
+        for inst_id in list(self._tree_items.keys()):
+            if inst_id not in wanted:
+                item = self._tree_items.pop(inst_id)
+                idx = self.tree.indexOfTopLevelItem(item)
+                if idx >= 0:
+                    self.tree.takeTopLevelItem(idx)
+
+        # Insert / update.
+        for inst_id, inst in wanted.items():
+            item = self._tree_items.get(inst_id)
+            if item is None:
+                item = QTreeWidgetItem()
+                item.setData(0, Qt.UserRole, inst_id)
+                self.tree.addTopLevelItem(item)
+                self._tree_items[inst_id] = item
+            self._fill_row(item, inst)
+
+        # Empty-state overlay.
+        if not wanted:
+            self.empty_state.show()
+            self._position_empty_state()
+        else:
+            self.empty_state.hide()
+
+    def _fill_row(self, item: QTreeWidgetItem, inst):
+        s = inst.last_sample
+        item.setText(_COL_LABEL, inst.label)
+        item.setText(_COL_ACCOUNT, inst.account.label() if inst.account else _NO_ACCOUNT)
+        item.setText(_COL_PLACE, str(inst.place_id))
+        item.setText(_COL_PID, str(inst.pid) if inst.pid else "—")
+        item.setText(_COL_STATUS, _STATUS_GLYPH.get(inst.status, inst.status))
+        item.setText(_COL_AFK, _AFK_ON if inst.antiafk_on else _AFK_OFF)
+        item.setText(_COL_CPU, f"{s.cpu_percent:.0f}" if s.alive else "—")
+        item.setText(_COL_RAM, f"{s.rss_mb:.0f}" if s.alive else "—")
+        item.setText(_COL_JOB, inst.job_id or "—")
+        # Right-align the numeric columns.
+        for col in (_COL_CPU, _COL_RAM):
+            item.setTextAlignment(col, Qt.AlignRight | Qt.AlignVCenter)
+        item.setTextAlignment(_COL_AFK, Qt.AlignCenter)
+        # Red text for crashed rows; clear otherwise.
+        red = QColor("#ff5e5e") if self.config.cfg.theme == "dark" else QColor("#c81e1e")
+        default_color = QColor("#ffffff") if self.config.cfg.theme == "dark" else QColor("#1a1a1a")
+        color = red if inst.status == "crashed" else default_color
+        for col in range(9):
+            item.setForeground(col, color)
+
+    def _position_empty_state(self):
+        vp = self.tree.viewport()
+        self.empty_state.setGeometry(0, 0, vp.width(), vp.height())
+
+    def eventFilter(self, obj, event):
+        if obj is self.tree.viewport() and self.empty_state.isVisible():
+            from PySide6.QtCore import QEvent
+            if event.type() in (QEvent.Resize, QEvent.Show):
+                self._position_empty_state()
+        return super().eventFilter(obj, event)
+
+    def _on_tree_item_clicked(self, item: QTreeWidgetItem, column: int):
+        if column != _COL_AFK:
+            return
+        inst_id = item.data(0, Qt.UserRole)
+        inst = next((i for i in self.manager.instances if id(i) == inst_id), None)
+        if inst:
+            self._toggle_antiafk_for(inst)
+
+    # ---- presets tree ----------------------------------------------------
+
+    def _refresh_presets(self):
+        self.preset_tree.clear()
+        self._preset_items.clear()
+        for idx, p in enumerate(self.config.cfg.presets):
+            account = self.store.find(p.account_user_id) if p.account_user_id else None
+            acc_label = account.label() if account else (
+                "[missing account]" if p.account_user_id else "(signed-in)"
+            )
+            item = QTreeWidgetItem([p.label, str(p.place_id), acc_label])
+            item.setData(0, Qt.UserRole, idx)
+            self.preset_tree.addTopLevelItem(item)
+            self._preset_items[idx] = item
+
+    def _selected_preset_index(self) -> Optional[int]:
+        items = self.preset_tree.selectedItems()
+        if not items:
+            return None
+        return items[0].data(0, Qt.UserRole)
+
+    # ---- background work / async dispatch ------------------------------
 
     def _run_async(self, fn, on_done=None):
         def worker():
             try:
                 result, err = fn(), None
             except Exception as e:
+                log.exception("async worker raised")
                 result, err = None, e
-            self.after(0, lambda: self._finish(result, err, on_done))
+            self._async_done.emit(result, err, on_done)
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish(self, result, err, on_done):
+    def _finish_async(self, result, err, on_done):
         if err:
-            messagebox.showerror("Error", str(err))
-            self._set_status(f"Error: {err}")
+            self._set_status(f"Error: {err}", kind="error")
+            QMessageBox.critical(self, "Error", str(err))
         elif on_done:
             on_done(result)
         self._refresh_tree()
 
-    # ---- live instance actions ------------------------------------------
+    def _on_stats_tick(self):
+        try:
+            self.manager.refresh_stats()
+            self._refresh_tree()
+        except Exception:
+            log.exception("stats refresh failed")
+
+    # ---- actions: launch / hop / focus / close ------------------------
 
     def _on_launch(self):
-        place_id = servers.parse_place_id(self.place_var.get())
+        place_id = servers.parse_place_id(self.place_edit.text())
         if not place_id:
-            messagebox.showwarning("Invalid", "Enter a numeric placeId or roblox.com /games/<id>/ URL.")
+            QMessageBox.warning(
+                self, "Invalid game",
+                "Enter a numeric placeId or roblox.com /games/<id>/ URL.",
+            )
             return
         account = self._resolve_selected_account()
-        label = self.label_var.get().strip() or (account.label() if account else f"Instance {len(self.manager.instances) + 1}")
+        label = (self.label_edit.text().strip()
+                 or (account.label() if account else f"Instance {len(self.manager.instances) + 1}"))
         self.config.remember(place_id)
         self._set_status(f"Launching {label}…")
         self._run_async(
             lambda: self.manager.add_instance(label, place_id, account=account),
-            on_done=lambda inst: self._set_status(
-                f"{inst.label} launched (pid={inst.pid})" if inst.pid else f"{inst.label}: launcher started, pid not detected"
+            on_done=lambda inst: (
+                self._set_status(
+                    f"{inst.label} launched (pid={inst.pid})" if inst.pid
+                    else f"{inst.label}: launcher started, pid not detected"
+                ),
+                self._toast(f"Launched {inst.label}", kind="success"),
             ),
         )
 
     def _on_focus(self):
-        inst = self._selected_instance()
-        if not inst:
+        targets = self._selected_instances()
+        if not targets:
             return
+        inst = targets[0]
         ok = self.manager.focus(inst)
         self._set_status(f"Focused {inst.label}" if ok else f"Could not focus {inst.label}")
 
@@ -634,8 +749,11 @@ class App(tk.Tk):
 
         self._run_async(
             run_all,
-            on_done=lambda results: self._set_status(
-                "Hop done: " + ", ".join(f"{lbl}→{j}" for lbl, j in results)
+            on_done=lambda results: (
+                self._set_status(
+                    "Hop done: " + ", ".join(f"{lbl}→{j}" for lbl, j in results)
+                ),
+                self._toast(f"Hopped {len(results)} instance(s)", kind="success"),
             ),
         )
 
@@ -654,71 +772,44 @@ class App(tk.Tk):
         self._refresh_tree()
 
     def _on_toggle_antiafk(self):
-        targets = self._selected_instances()
-        if not targets:
-            return
-        for inst in targets:
+        for inst in self._selected_instances():
             self._toggle_antiafk_for(inst)
 
-    def _on_set_antiafk_all(self, enabled):
+    def _on_set_antiafk_all(self, enabled: bool):
         count = self.manager.set_antiafk_all(enabled)
         self._set_status(
             f"Anti-AFK {'enabled' if enabled else 'disabled'} on {count} instance(s)."
         )
         self._refresh_tree()
 
-    def _on_tree_click(self, event):
-        # Make clicking inside the AFK column toggle that single row, without
-        # disturbing the multi-row selection used for bulk hop/close actions.
-        region = self.tree.identify("region", event.x, event.y)
-        if region != "cell":
-            return
-        col = self.tree.identify_column(event.x)
-        if col != _AFK_COL_INDEX:
-            return
-        row_id = self.tree.identify_row(event.y)
-        if not row_id:
-            return
-        inst = next(
-            (i for i in self.manager.instances if _row_iid(i) == row_id),
-            None,
-        )
-        if inst is None:
-            return
-        self._toggle_antiafk_for(inst)
-        return "break"
-
-    # ---- preset actions --------------------------------------------------
+    # ---- preset actions ------------------------------------------------
 
     def _on_save_preset(self):
-        place_id = servers.parse_place_id(self.place_var.get())
+        place_id = servers.parse_place_id(self.place_edit.text())
         if not place_id:
-            messagebox.showwarning("Invalid", "Enter a placeId or URL to save.")
+            QMessageBox.warning(self, "Invalid", "Enter a placeId or URL to save.")
             return
         account = self._resolve_selected_account()
-        label = self.label_var.get().strip() or (account.label() if account else f"Preset {len(self.config.cfg.presets) + 1}")
+        label = (self.label_edit.text().strip()
+                 or (account.label() if account else f"Preset {len(self.config.cfg.presets) + 1}"))
         self.config.upsert(Preset(
             label=label, place_id=place_id,
             account_user_id=account.user_id if account else None,
         ))
         self._refresh_presets()
         self._set_status(f"Saved preset '{label}'.")
-
-    def _selected_preset_index(self):
-        sel = self.preset_tree.selection()
-        if not sel:
-            return None
-        return self.preset_tree.index(sel[0])
+        self._toast(f"Saved preset '{label}'", kind="success")
 
     def _launch_preset(self, preset: Preset):
         account = self.store.find(preset.account_user_id) if preset.account_user_id else None
         if preset.account_user_id and account is None:
-            self._set_status(f"Preset '{preset.label}': saved account missing; falling back to signed-in.")
+            self._set_status(f"Preset '{preset.label}': saved account missing; using signed-in.")
         self._set_status(f"Launching {preset.label}…")
         self._run_async(
             lambda: self.manager.add_instance(preset.label, preset.place_id, account=account),
             on_done=lambda inst: self._set_status(
-                f"{inst.label} launched (pid={inst.pid})" if inst.pid else f"{inst.label}: pid not detected"
+                f"{inst.label} launched (pid={inst.pid})" if inst.pid
+                else f"{inst.label}: pid not detected"
             ),
         )
 
@@ -742,6 +833,7 @@ class App(tk.Tk):
                     inst = self.manager.add_instance(p.label, p.place_id, account=account)
                     results.append((p.label, inst.pid))
                 except Exception as e:
+                    log.exception("preset launch failed: %s", p.label)
                     results.append((p.label, f"error: {e}"))
             return results
 
@@ -757,209 +849,282 @@ class App(tk.Tk):
         if idx is None:
             return
         preset = self.config.cfg.presets[idx]
-        if messagebox.askyesno("Remove", f"Remove preset '{preset.label}'?"):
-            self.config.remove(idx)
-            self._refresh_presets()
+        if QMessageBox.question(
+            self, "Remove", f"Remove preset '{preset.label}'?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        self.config.remove(idx)
+        self._refresh_presets()
+        self._set_status(f"Removed preset '{preset.label}'.")
 
-    # ---- lifecycle -------------------------------------------------------
+    # ---- mode / accounts / lifecycle ----------------------------------
 
-    def _on_mode_changed(self):
-        mode = self.mode_var.get()
+    def _on_mode_changed(self, mode: str):
         self.manager.launch_mode = mode
         self.config.cfg.launch_mode = mode
         self.config.save()
         self._set_status(
-            "Launches will go through RobloxPlayerLauncher." if mode == "protocol"
+            "Launches will go through RobloxPlayerLauncher."
+            if mode == "protocol"
             else "Launches will spawn RobloxPlayerBeta directly."
         )
 
     def _open_account_manager(self):
-        AccountManager(
-            self, self.store,
-            on_change=lambda: (self._refresh_accounts_dropdown(), self._refresh_presets()),
-            theme_name=self.config.cfg.theme,
+        dlg = AccountManagerDialog(self, self.store)
+        dlg.account_changed.connect(self._on_accounts_changed)
+        dlg.exec()
+
+    def _on_accounts_changed(self):
+        self._refresh_accounts_dropdown()
+        self._refresh_presets()
+
+    def _open_logs(self):
+        try:
+            os.startfile(str(self.log_path.parent))
+        except Exception as e:
+            log.exception("could not open log folder")
+            QMessageBox.critical(self, "Logs", f"Could not open {self.log_path.parent}: {e}")
+
+    def _show_about(self):
+        QMessageBox.about(
+            self, "About Multi Roblox Manager",
+            "<b>Multi Roblox Manager</b><br><br>"
+            f"Roblox client detected: {self.roblox_version}<br>"
+            f"Log folder: {self.log_path.parent}<br><br>"
+            "Holds the Roblox singleton mutex so multiple clients can run, "
+            "with per-account ticket auth, profile isolation, server hop, and Anti-AFK.",
         )
 
-    def _on_close(self):
-        if self.manager.instances and not messagebox.askyesno(
-            "Quit", "Closing will terminate all managed Roblox instances. Continue?"
-        ):
-            return
-        self.manager.shutdown()
-        self.destroy()
+    def closeEvent(self, event):
+        if self.manager.instances:
+            ans = QMessageBox.question(
+                self, "Quit",
+                "Closing will terminate all managed Roblox instances. Continue?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if ans != QMessageBox.Yes:
+                event.ignore()
+                return
+        try:
+            self.manager.shutdown()
+        except Exception:
+            log.exception("manager shutdown failed")
+        super().closeEvent(event)
 
 
-class AccountManager(tk.Toplevel):
-    """Add/remove accounts. Cookies are validated then DPAPI-encrypted at rest."""
+# ---------------------------------------------------------------------------
+# Account manager dialog
 
-    def __init__(self, parent, store: AccountStore, on_change=None,
-                 theme_name: str = "dark"):
+
+class AccountManagerDialog(QDialog):
+    """Add / remove Roblox accounts. Cookies are validated then DPAPI-encrypted."""
+
+    account_changed = Signal()
+
+    def __init__(self, parent: MainWindow, store: AccountStore):
         super().__init__(parent)
-        self.title("Accounts")
-        self.geometry("620x480")
-        self.transient(parent)
+        self.setWindowTitle("Accounts")
+        self.resize(640, 500)
         self.store = store
-        self.on_change = on_change
-        self._theme_name = theme_name
 
-        header = ttk.Frame(self, padding=(14, 12, 14, 4))
-        header.pack(fill=tk.X)
-        ttk.Label(header, text="Manage Roblox accounts",
-                  font=("Segoe UI", 12, "bold")).pack(side=tk.LEFT)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
 
-        cols = ("nickname", "username", "user_id", "proxy")
-        tree_wrap = ttk.Frame(self, padding=(14, 4, 14, 4))
-        tree_wrap.pack(fill=tk.BOTH, expand=True)
-        self.tree = ttk.Treeview(tree_wrap, columns=cols, show="headings", selectmode="browse")
-        for col, head, w in (
-            ("nickname", "Nickname", 140),
-            ("username", "Username", 160),
-            ("user_id", "User ID", 90),
-            ("proxy", "Proxy", 180),
-        ):
-            self.tree.heading(col, text=head)
-            self.tree.column(col, width=w, anchor=tk.W)
-        scroll = ttk.Scrollbar(tree_wrap, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scroll.set)
-        self.tree.grid(row=0, column=0, sticky=tk.NSEW)
-        scroll.grid(row=0, column=1, sticky=tk.NS)
-        tree_wrap.rowconfigure(0, weight=1)
-        tree_wrap.columnconfigure(0, weight=1)
-        self.tree.bind("<<TreeviewSelect>>", self._on_select_row)
+        title = QLabel("Manage Roblox accounts")
+        title.setObjectName("titleLabel")
+        layout.addWidget(title)
 
-        form = ttk.LabelFrame(self, text="Add or update account", padding=10)
-        form.pack(fill=tk.X, padx=14, pady=(8, 4))
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(4)
+        self.tree.setHeaderLabels(["Nickname", "Username", "User ID", "Proxy"])
+        self.tree.setRootIsDecorated(False)
+        self.tree.setAlternatingRowColors(True)
+        for i, w in enumerate((140, 160, 100, 180)):
+            self.tree.setColumnWidth(i, w)
+        self.tree.itemSelectionChanged.connect(self._on_select_row)
+        layout.addWidget(self.tree, 1)
 
-        ttk.Label(form, text="Nickname (optional):").grid(row=0, column=0, sticky=tk.W)
-        self.nickname_var = tk.StringVar()
-        ttk.Entry(form, textvariable=self.nickname_var, width=22).grid(row=0, column=1, sticky=tk.W, padx=6)
-        ttk.Label(form, text="Proxy URL (optional):").grid(row=0, column=2, sticky=tk.W, padx=(12, 0))
-        self.proxy_var = tk.StringVar()
-        ttk.Entry(form, textvariable=self.proxy_var, width=30).grid(row=0, column=3, sticky=tk.W, padx=6)
+        form_box = QGroupBox("Add or update account")
+        fl = QGridLayout(form_box)
+        fl.setVerticalSpacing(8)
+        fl.setHorizontalSpacing(10)
+        fl.setContentsMargins(12, 18, 12, 12)
 
-        ttk.Label(form, text=".ROBLOSECURITY cookie:").grid(row=1, column=0, sticky=tk.NW, pady=(8, 0))
-        self.cookie_text = tk.Text(form, height=4, width=64, wrap=tk.WORD)
-        self.cookie_text.grid(row=1, column=1, columnspan=3, sticky=tk.EW, padx=6, pady=(8, 0))
-        form.columnconfigure(3, weight=1)
+        fl.addWidget(QLabel("Nickname (optional)"), 0, 0)
+        self.nickname_edit = QLineEdit()
+        fl.addWidget(self.nickname_edit, 0, 1)
+        fl.addWidget(QLabel("Proxy URL (optional)"), 0, 2)
+        self.proxy_edit = QLineEdit()
+        self.proxy_edit.setPlaceholderText("http://user:pass@host:port or socks5://host:port")
+        fl.addWidget(self.proxy_edit, 0, 3)
+        fl.setColumnStretch(1, 1)
+        fl.setColumnStretch(3, 1)
 
-        btns = ttk.Frame(self, padding=(14, 4, 14, 8))
-        btns.pack(fill=tk.X)
-        ttk.Button(btns, text="Add / Update", command=self._on_add).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(btns, text="Sign in with Browser…", command=self._on_browser_login).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="Update Proxy", command=self._on_update_proxy).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="Remove Selected", command=self._on_remove).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="Close", command=self.destroy).pack(side=tk.RIGHT, padx=(4, 0))
+        fl.addWidget(QLabel(".ROBLOSECURITY cookie"), 1, 0, Qt.AlignTop)
+        self.cookie_edit = QTextEdit()
+        self.cookie_edit.setFixedHeight(80)
+        fl.addWidget(self.cookie_edit, 1, 1, 1, 3)
+        layout.addWidget(form_box)
 
-        self.status_var = tk.StringVar(value=(
-            "Proxy URL (e.g. http://user:pass@host:port or socks5://host:port) is applied to Roblox auth calls only;"
-            " game-client traffic still routes directly unless you also have a system-wide proxy."
-        ))
-        ttk.Label(self, textvariable=self.status_var, anchor=tk.W,
-                  padding=(14, 6), wraplength=590, justify=tk.LEFT,
-                  foreground="#7a7a7a").pack(fill=tk.X, side=tk.BOTTOM)
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        self.add_btn = QPushButton("Add / Update")
+        self.add_btn.setObjectName("primaryButton")
+        self.add_btn.clicked.connect(self._on_add)
+        self.browser_btn = QPushButton("Sign in with Browser…")
+        self.browser_btn.clicked.connect(self._on_browser_login)
+        self.proxy_btn = QPushButton("Update Proxy")
+        self.proxy_btn.clicked.connect(self._on_update_proxy)
+        self.remove_btn = QPushButton("Remove Selected")
+        self.remove_btn.clicked.connect(self._on_remove)
+        for b in (self.add_btn, self.browser_btn, self.proxy_btn, self.remove_btn):
+            btn_row.addWidget(b)
+        btn_row.addStretch(1)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
 
-        # sv-ttk theming is global once set, but the title bar of this
-        # Toplevel needs its own DwmSetWindowAttribute call, and the
-        # Text widget needs explicit colors since it's not a ttk widget.
-        theme.apply(self, self._theme_name, native_widgets=[self.cookie_text])
+        self.status_label = QLabel(
+            "Proxy URL is applied to Roblox auth calls only; "
+            "game-client traffic still routes directly unless you also have a "
+            "system-wide proxy."
+        )
+        self.status_label.setObjectName("muted")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
         self._refresh()
+        # Dark title bar for this Toplevel too. winId is only valid after show.
+        QTimer.singleShot(
+            0, lambda: _apply_dark_title_bar(self, parent.config.cfg.theme == "dark"),
+        )
 
     def _refresh(self):
-        self.tree.delete(*self.tree.get_children())
+        self.tree.clear()
         for acc in self.store:
-            self.tree.insert("", tk.END, iid=str(acc.user_id),
-                             values=(acc.nickname, acc.username, acc.user_id, acc.proxy or "—"))
-        if self.on_change:
-            self.on_change()
+            item = QTreeWidgetItem([acc.nickname, acc.username, str(acc.user_id), acc.proxy or "—"])
+            item.setData(0, Qt.UserRole, acc.user_id)
+            self.tree.addTopLevelItem(item)
+        self.account_changed.emit()
 
-    def _on_select_row(self, _event=None):
-        sel = self.tree.selection()
-        if not sel:
+    def _on_select_row(self):
+        items = self.tree.selectedItems()
+        if not items:
             return
-        acc = self.store.find(int(sel[0]))
+        user_id = items[0].data(0, Qt.UserRole)
+        acc = self.store.find(user_id)
         if acc:
-            self.nickname_var.set(acc.nickname)
-            self.proxy_var.set(acc.proxy)
+            self.nickname_edit.setText(acc.nickname)
+            self.proxy_edit.setText(acc.proxy)
 
     def _on_update_proxy(self):
-        sel = self.tree.selection()
-        if not sel:
-            messagebox.showinfo("Select", "Select an account row first.")
+        items = self.tree.selectedItems()
+        if not items:
+            QMessageBox.information(self, "Select", "Select an account row first.")
             return
-        user_id = int(sel[0])
-        self.store.update_proxy(user_id, self.proxy_var.get().strip())
-        self.status_var.set("Proxy updated.")
+        user_id = items[0].data(0, Qt.UserRole)
+        self.store.update_proxy(user_id, self.proxy_edit.text().strip())
+        self.status_label.setText("Proxy updated.")
         self._refresh()
 
     def _on_add(self):
-        cookie = self.cookie_text.get("1.0", tk.END).strip()
+        cookie = self.cookie_edit.toPlainText().strip()
         if not cookie:
-            messagebox.showwarning("Missing", "Paste your .ROBLOSECURITY cookie.")
+            QMessageBox.warning(self, "Missing", "Paste your .ROBLOSECURITY cookie.")
             return
-        nickname = self.nickname_var.get().strip()
-        proxy = self.proxy_var.get().strip()
-        self.status_var.set("Validating cookie with Roblox…")
-        self.update_idletasks()
+        nickname = self.nickname_edit.text().strip()
+        proxy = self.proxy_edit.text().strip()
+        self.status_label.setText("Validating cookie with Roblox…")
+        QApplication.processEvents()
         try:
             acc = self.store.add_or_update(cookie, nickname=nickname, proxy=proxy)
         except Exception as e:
             log.exception("account validation failed")
-            messagebox.showerror("Validation failed", str(e))
-            self.status_var.set(f"Error: {e}")
+            QMessageBox.critical(self, "Validation failed", str(e))
+            self.status_label.setText(f"Error: {e}")
             return
-        self.cookie_text.delete("1.0", tk.END)
-        self.nickname_var.set("")
-        self.proxy_var.set("")
-        self.status_var.set(f"Saved {acc.label()} (user {acc.user_id}).")
+        self.cookie_edit.clear()
+        self.nickname_edit.clear()
+        self.proxy_edit.clear()
+        self.status_label.setText(f"Saved {acc.label()} (user {acc.user_id}).")
         self._refresh()
 
     def _on_remove(self):
-        sel = self.tree.selection()
-        if not sel:
+        items = self.tree.selectedItems()
+        if not items:
             return
-        user_id = int(sel[0])
+        user_id = items[0].data(0, Qt.UserRole)
         acc = self.store.find(user_id)
-        if acc and messagebox.askyesno("Remove", f"Remove {acc.label()}?"):
+        if acc and QMessageBox.question(
+            self, "Remove", f"Remove {acc.label()}?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        ) == QMessageBox.Yes:
             self.store.remove(user_id)
-            self.status_var.set(f"Removed {acc.label()}.")
+            self.status_label.setText(f"Removed {acc.label()}.")
             self._refresh()
 
     def _on_browser_login(self):
         if not browser_login.is_available():
-            messagebox.showinfo("pywebview required", browser_login.install_hint())
+            QMessageBox.information(self, "pywebview required", browser_login.install_hint())
             return
-        nickname = self.nickname_var.get().strip()
-        proxy = self.proxy_var.get().strip()
-        self.status_var.set("Opening Roblox sign-in window… complete sign-in (password, QR, or passkey).")
-        self.update_idletasks()
+        nickname = self.nickname_edit.text().strip()
+        proxy = self.proxy_edit.text().strip()
+        self.status_label.setText(
+            "Opening Roblox sign-in window… complete sign-in (password, QR, or passkey)."
+        )
+        QApplication.processEvents()
 
         def worker():
             cookie = browser_login.harvest_via_subprocess()
-            self.after(0, lambda: self._finish_browser_login(cookie, nickname, proxy))
-
+            # Schedule the rest on the GUI thread.
+            QTimer.singleShot(
+                0, lambda: self._finish_browser_login(cookie, nickname, proxy),
+            )
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_browser_login(self, cookie, nickname, proxy):
+    def _finish_browser_login(self, cookie: Optional[str], nickname: str, proxy: str):
         if not cookie:
-            self.status_var.set("Sign-in cancelled or failed before a cookie was captured.")
+            self.status_label.setText("Sign-in cancelled or failed before a cookie was captured.")
             return
         try:
             acc = self.store.add_or_update(cookie, nickname=nickname, proxy=proxy)
         except Exception as e:
             log.exception("account validation after browser login failed")
-            messagebox.showerror("Validation failed", str(e))
-            self.status_var.set(f"Error: {e}")
+            QMessageBox.critical(self, "Validation failed", str(e))
+            self.status_label.setText(f"Error: {e}")
             return
-        self.nickname_var.set("")
-        self.proxy_var.set("")
-        self.status_var.set(f"Signed in as {acc.label()} (user {acc.user_id}).")
+        self.nickname_edit.clear()
+        self.proxy_edit.clear()
+        self.status_label.setText(f"Signed in as {acc.label()} (user {acc.user_id}).")
         self._refresh()
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+
+
 def run(scale: float = 1.0):
-    App(scale=scale).mainloop()
+    # Per-monitor DPI handling: PassThrough means Qt receives fractional
+    # scale factors as-is instead of rounding to the nearest integer, which
+    # gives crisper rendering on 125% / 150% / 175% displays.
+    try:
+        QApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough,
+        )
+    except Exception:
+        pass
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setApplicationName("Multi Roblox Manager")
+    app.setOrganizationName("MultiRobloxManager")
+
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
 
 
 def main():
-    # Kept for backwards compatibility (e.g. `python -m multi_roblox.gui`).
     run()

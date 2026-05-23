@@ -21,9 +21,12 @@ echo Building MultiRobloxManager.exe...
     --onefile ^
     --windowed ^
     --name MultiRobloxManager ^
+    --collect-all PySide6 ^
+    --collect-submodules shiboken6 ^
     --collect-all pywebview ^
     --collect-all psutil ^
-    --collect-all sv_ttk ^
+    --exclude-module PyQt5 ^
+    --exclude-module PyQt6 ^
     main.py || goto :fail
 
 if not exist dist\MultiRobloxManager.exe goto :fail
