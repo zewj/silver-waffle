@@ -23,6 +23,7 @@ echo Building MultiRobloxManager.exe...
     --name MultiRobloxManager ^
     --collect-all pywebview ^
     --collect-all psutil ^
+    --collect-all sv_ttk ^
     main.py || goto :fail
 
 if not exist dist\MultiRobloxManager.exe goto :fail

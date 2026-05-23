@@ -51,6 +51,10 @@ server hopping that doesn't trip the "you are joining too quickly" errors.
   there's an **Open Logs** button so you can grab it for bug reports.
 - **Roblox version awareness**: the detected client version is shown in
   the status bar and logged so you can correlate breakage with updates.
+- **Dark / light theme**: ships with a modern dark theme (Sun Valley via
+  `sv-ttk`) on by default; **Toggle Theme** in the toolbar flips it
+  and the choice persists. Title bars get the native Windows
+  `DwmSetWindowAttribute` dark mode applied so the chrome matches.
 - **Per-instance Anti-AFK**: each row has an *Anti-AFK* column you can
   click to toggle, plus **Enable Anti-AFK on All** / **Disable on All**
   buttons. When a tick fires we `PostMessageW` a 5–15 px mouse jitter

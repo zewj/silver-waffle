@@ -6,7 +6,7 @@ import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from . import browser_login, launcher, logging_setup, servers
+from . import browser_login, launcher, logging_setup, servers, theme
 from .accounts import AccountStore
 from .config import ConfigStore, Preset
 from .manager import InstanceManager
@@ -38,6 +38,7 @@ class App(tk.Tk):
         log.info("detected Roblox version: %s", self.roblox_version)
 
         self._build_ui()
+        self._apply_theme(self.config.cfg.theme, persist=False)
         self._refresh_accounts_dropdown()
         self._refresh_presets()
         self._refresh_tree()
@@ -131,6 +132,7 @@ class App(tk.Tk):
         ttk.Button(actions, text="Disable on All", command=lambda: self._on_set_antiafk_all(False)).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Close", command=self._on_close_instance).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Open Logs", command=self._open_logs).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(actions, text="Toggle Theme", command=self._on_toggle_theme).pack(side=tk.RIGHT, padx=4)
 
         self.status_var = tk.StringVar(value=(
             f"Ready. Roblox {self.roblox_version} detected; mutex held; "
@@ -205,6 +207,28 @@ class App(tk.Tk):
         except Exception:
             log.exception("stats refresh failed")
         self.after(_STATS_REFRESH_MS, self._schedule_stats_refresh)
+
+    def _apply_theme(self, requested: str, persist: bool = True) -> None:
+        applied = theme.apply(self, requested, native_widgets=[self.preset_list])
+        # crashed-row color depends on theme contrast.
+        self.tree.tag_configure("crashed", foreground=theme.crashed_fg(applied))
+        if persist and applied != self.config.cfg.theme:
+            self.config.cfg.theme = applied
+            self.config.save()
+        elif persist:
+            self.config.cfg.theme = applied
+            self.config.save()
+
+    def _on_toggle_theme(self):
+        if not theme.is_available():
+            messagebox.showinfo(
+                "Theme",
+                "Dark mode needs sv-ttk. Install with:\n  pip install sv-ttk",
+            )
+            return
+        new = "light" if self.config.cfg.theme == "dark" else "dark"
+        self._apply_theme(new)
+        self._set_status(f"Theme: {new}.")
 
     def _open_logs(self):
         try:
@@ -419,7 +443,11 @@ class App(tk.Tk):
         )
 
     def _open_account_manager(self):
-        AccountManager(self, self.store, on_change=lambda: (self._refresh_accounts_dropdown(), self._refresh_presets()))
+        AccountManager(
+            self, self.store,
+            on_change=lambda: (self._refresh_accounts_dropdown(), self._refresh_presets()),
+            theme_name=self.config.cfg.theme,
+        )
 
     def _on_close(self):
         if self.manager.instances and not messagebox.askyesno(
@@ -433,13 +461,15 @@ class App(tk.Tk):
 class AccountManager(tk.Toplevel):
     """Add/remove accounts. Cookies are validated then DPAPI-encrypted at rest."""
 
-    def __init__(self, parent, store: AccountStore, on_change=None):
+    def __init__(self, parent, store: AccountStore, on_change=None,
+                 theme_name: str = "dark"):
         super().__init__(parent)
         self.title("Accounts")
         self.geometry("580x440")
         self.transient(parent)
         self.store = store
         self.on_change = on_change
+        self._theme_name = theme_name
 
         cols = ("nickname", "username", "user_id", "proxy")
         self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="browse")
@@ -480,6 +510,10 @@ class AccountManager(tk.Toplevel):
         ))
         ttk.Label(self, textvariable=self.status_var, anchor=tk.W, padding=(10, 4), wraplength=560, justify=tk.LEFT).pack(fill=tk.X, side=tk.BOTTOM)
 
+        # sv-ttk theming is global once set, but the title bar of this
+        # Toplevel needs its own DwmSetWindowAttribute call, and the
+        # Text widget needs explicit colors since it's not a ttk widget.
+        theme.apply(self, self._theme_name, native_widgets=[self.cookie_text])
         self._refresh()
 
     def _refresh(self):
