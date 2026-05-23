@@ -98,7 +98,11 @@ class Toast(QFrame):
         super().__init__(parent)
         self.setObjectName("toast")
         self.setProperty("kind", kind)
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        # Dynamic property selectors (`QFrame#toast[kind="success"]`) only
+        # apply after the style engine re-polishes the widget; without
+        # this the colored left-border never appears.
+        self.style().unpolish(self)
+        self.style().polish(self)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(14, 10, 14, 10)
@@ -375,7 +379,10 @@ class MainWindow(QMainWindow):
         header = self.tree.header()
         header.setStretchLastSection(True)
         header.setSectionResizeMode(QHeaderView.Interactive)
-        widths = [130, 140, 90, 60, 100, 90, 70, 80, 220]
+        # Sized so the eight informational columns fit in the default
+        # splitter weight (~60% of 1120px); jobId stretches to fill
+        # whatever's left and grows when the user drags the splitter.
+        widths = [100, 110, 85, 55, 90, 75, 55, 65]  # 9th col stretches
         for i, w in enumerate(widths):
             self.tree.setColumnWidth(i, w)
         self.tree.itemClicked.connect(self._on_tree_item_clicked)
@@ -414,7 +421,9 @@ class MainWindow(QMainWindow):
         self.preset_tree.setAlternatingRowColors(True)
         self.preset_tree.setUniformRowHeights(True)
         self.preset_tree.header().setStretchLastSection(True)
-        for i, w in enumerate((130, 90, 130)):
+        # Account column stretches; the first two are sized for the right
+        # pane's ~40% splitter weight.
+        for i, w in enumerate((120, 85)):
             self.preset_tree.setColumnWidth(i, w)
         self.preset_tree.itemDoubleClicked.connect(lambda _i, _c: self._on_launch_preset())
         wrap.addWidget(self.preset_tree, 1)
@@ -514,6 +523,11 @@ class MainWindow(QMainWindow):
         if persist:
             self.config.cfg.theme = theme
             self.config.save()
+        # Per-cell foreground colors (e.g. crashed rows in red) are set
+        # imperatively in _fill_row, so they don't auto-update when QSS
+        # changes — refresh the tree to pick up the new theme's colors.
+        if hasattr(self, "tree"):
+            self._refresh_tree()
         log.info("theme applied: %s", theme)
 
     def _on_toggle_theme(self):
@@ -540,9 +554,9 @@ class MainWindow(QMainWindow):
 
     def _toast(self, message: str, kind: str = "info", duration_ms: int = 2800):
         toast = Toast(self, message, kind=kind, duration_ms=duration_ms)
-        # Anchor to the bottom-right of the central widget.
-        anchor = self.mapToGlobal(QPoint(self.width(), self.height() - self.statusBar().height()))
-        anchor = self.mapFromGlobal(anchor)
+        # Bottom-right of the main window, just above the status bar.
+        # Toast is a child widget so this is already in local coords.
+        anchor = QPoint(self.width(), self.height() - self.statusBar().height())
         toast.show_at(anchor)
 
     def _refresh_accounts_dropdown(self):
