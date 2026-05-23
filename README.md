@@ -57,11 +57,12 @@ server hopping that doesn't trip the "you are joining too quickly" errors.
   plus an occasional `F15` keystroke — a dead function key no game binds)
   is `PostMessageW`-ed straight to the background Roblox HWND every
   12–35 s with randomization. **Auto-pauses whenever the target window
-  is the foreground window**, so if you're actively in that instance
-  (intense PvP, 1v1, etc.) the synthetic input never fires and can't
-  cause a misinput — your real input is already keeping Roblox awake.
-  Each worker sleeps almost the entire interval, so dozens of them idle
-  at effectively zero CPU.
+  is foregrounded *and* the user has produced real input in the last
+  60 s** — PvP / 1v1 safety so synthetic input can't clash with your
+  real clicks. If you're AFK in your own foregrounded Roblox window,
+  the ticker resumes (via `GetLastInputInfo`) so Roblox's 20-min kick
+  still doesn't fire. Each worker sleeps almost the entire interval,
+  so dozens of them idle at effectively zero CPU.
 - **Focus + cycle**: per-instance focus button, plus `Ctrl+Tab` to cycle.
   Uses `AttachThreadInput` + `SetForegroundWindow` to defeat focus-stealing
   prevention.

@@ -35,6 +35,27 @@ _user32.IsWindow.restype = wintypes.BOOL
 _user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
 _user32.GetClientRect.restype = wintypes.BOOL
 _kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+_kernel32.GetTickCount.restype = wintypes.DWORD
+
+
+class _LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+
+
+_user32.GetLastInputInfo.argtypes = [ctypes.POINTER(_LASTINPUTINFO)]
+_user32.GetLastInputInfo.restype = wintypes.BOOL
+
+
+def system_idle_seconds() -> float:
+    """Seconds since the last system-wide keyboard/mouse input."""
+    info = _LASTINPUTINFO()
+    info.cbSize = ctypes.sizeof(_LASTINPUTINFO)
+    if not _user32.GetLastInputInfo(ctypes.byref(info)):
+        return 0.0
+    now = _kernel32.GetTickCount()
+    # GetTickCount wraps at ~49.7 days; mask to 32 bits so subtraction stays positive.
+    diff = (now - info.dwTime) & 0xFFFFFFFF
+    return diff / 1000.0
 
 SW_RESTORE = 9
 ROBLOX_EXE = "RobloxPlayerBeta.exe"

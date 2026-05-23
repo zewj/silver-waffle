@@ -14,10 +14,16 @@ Per cycle (random 12–35 s) we:
     second signal for game builds that only watch keyboard input.
 
 The ticker **auto-pauses whenever the target window is the foreground
-window**. If you're actively in that Roblox instance (intense PvP, 1v1,
-clicking around), the synthetic input doesn't fire and can't clash
-with your real actions. Your live input is already keeping Roblox's
-idle timer reset, so nothing's lost.
+window *and* the user has produced real input recently** (default: in
+the last 60 s). Two scenarios:
+
+  * Foreground + user active → skip. PvP / 1v1 safety: your real
+    clicks are already keeping Roblox awake, synthetic input would
+    only risk a misinput.
+  * Foreground + user idle for >60 s → tick. You're AFK in your own
+    window (got up, looking at your phone, whatever); Roblox's 20-min
+    kick is coming if we don't poke it. The synthetic input can't
+    clash with input you aren't generating.
 
 Each instance has its own `AntiAFK` thread; the thread sleeps almost
 all the time so dozens of them are still effectively zero-CPU.
@@ -60,6 +66,12 @@ MOVE_MAX = 15
 # engine-level idle timer, so the keystroke is belt-and-suspenders and
 # can fire less often to further reduce any clash risk.
 KEYSTROKE_EVERY = 5
+
+# When the target window is foregrounded, treat the user as "really AFK"
+# (and therefore safe to tick) only after this many seconds of no system
+# keyboard / mouse activity. Well under Roblox's 20-min kick, so we'll
+# get multiple ticks in before it fires.
+USER_IDLE_THRESHOLD_SEC = 60.0
 
 
 def _make_lparam_coord(x: int, y: int) -> int:
@@ -121,17 +133,19 @@ class AntiAFK:
     def _resolve_hwnd(self) -> Optional[int]:
         """Return the live HWND, or None if we should skip this cycle.
 
-        Returns None when the target is the current foreground window —
-        the user is actively playing that instance, their real input is
-        already resetting Roblox's idle timer, and firing synthetic
-        input now could collide with their actions in intense moments
-        (PvP, 1v1, etc.).
+        Skip when the target window is foregrounded *and* the user has
+        produced real input within `USER_IDLE_THRESHOLD_SEC`. If the
+        window's foregrounded but the user has been idle longer than
+        that, we tick anyway — they're AFK in their own window and
+        Roblox would kick them; the synthetic input can't collide with
+        input that isn't happening.
         """
         hwnd = self._lookup()
         if not hwnd or not windows._user32.IsWindow(hwnd):
             return None
         if windows._user32.GetForegroundWindow() == hwnd:
-            return None
+            if windows.system_idle_seconds() < USER_IDLE_THRESHOLD_SEC:
+                return None
         return hwnd
 
     def _send_jitter(self, hwnd: int) -> None:
