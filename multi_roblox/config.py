@@ -26,6 +26,9 @@ class Config:
     presets: list[Preset] = field(default_factory=list)
     recent_places: list[int] = field(default_factory=list)
     launch_cooldown: float = 2.5
+    # "protocol": go through RobloxPlayerLauncher.exe (stable, default).
+    # "direct":   spawn RobloxPlayerBeta.exe directly (faster, skips launcher).
+    launch_mode: str = "protocol"
 
     def _key(self, p: Preset):
         return (p.label, p.place_id, p.account_user_id)
@@ -60,10 +63,14 @@ class ConfigStore:
             data = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return Config()
+        mode = data.get("launch_mode", "protocol")
+        if mode not in ("protocol", "direct"):
+            mode = "protocol"
         return Config(
             presets=[Preset(**p) for p in data.get("presets", [])],
             recent_places=data.get("recent_places", []),
             launch_cooldown=float(data.get("launch_cooldown", 2.5)),
+            launch_mode=mode,
         )
 
     def save(self):
@@ -73,6 +80,7 @@ class ConfigStore:
                 "presets": [asdict(p) for p in self.cfg.presets],
                 "recent_places": self.cfg.recent_places,
                 "launch_cooldown": self.cfg.launch_cooldown,
+                "launch_mode": self.cfg.launch_mode,
             }, indent=2), encoding="utf-8")
             tmp.replace(self.path)
 

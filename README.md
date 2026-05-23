@@ -17,9 +17,14 @@ server hopping that doesn't trip the "you are joining too quickly" errors.
   one-shot ticket minted from a saved `.ROBLOSECURITY` cookie. Different
   instances run as different accounts at the same time, regardless of
   which account the Roblox launcher is signed into.
-- **Skips the official launcher**: spawns `RobloxPlayerBeta.exe` directly
-  with `-t <ticket> -j <PlaceLauncher URL>`. No `RobloxPlayerLauncher.exe`,
-  no `roblox://` protocol round-trip when using a saved account.
+- **Stable launches via the official launcher (default)**: opens a
+  `roblox-player:1+launchmode:play+gameinfo:<ticket>+placelauncherurl:…`
+  URL so `RobloxPlayerLauncher.exe` runs updates / sets up Hyperion's
+  expected parent process, then spawns `RobloxPlayerBeta.exe` itself with
+  the same ticket. Multi-account still holds — the ticket carries the
+  identity. A **Direct** mode that runs `RobloxPlayerBeta.exe` itself is
+  available for users who don't want the launcher in the loop, and the
+  protocol path auto-falls-back to direct exec if it stalls.
 - **Persistent presets**: launch configurations (label + place + account)
   are saved to disk and survive restarts. "Launch All" boots them in one
   click, spaced to avoid join throttling.
@@ -121,8 +126,9 @@ Launches across the whole app are spaced by `launch_cooldown` (default
 | ----------------------------------------- | ---------------------------------------------------------------------------------------------- |
 | "Roblox is already running"               | Holds `ROBLOX_singletonEvent` so the second client skips that branch.                          |
 | Rate-limit / "joining too quickly" / 729  | `LAUNCH_COOLDOWN` between any two launches; recent-jobId blocklist when hopping.               |
-| "Authentication failed" on extra clients  | Per-account auth ticket → `-t TICKET`; the launcher's signed-in account is irrelevant.         |
+| "Authentication failed" on extra clients  | Per-account auth ticket → `gameinfo:<TICKET>` in the protocol URL; the launcher's signed-in account is irrelevant. |
 | Close-and-reopen flash on hop             | Overlap hop: new client up before old PID is killed.                                           |
+| Hyperion / launcher-update flakiness      | Default `protocol` mode goes through `RobloxPlayerLauncher.exe`; if it stalls, the manager refetches a ticket and falls back to direct exec automatically. |
 
 ## File layout
 

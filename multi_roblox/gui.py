@@ -22,6 +22,7 @@ class App(tk.Tk):
         self.config = ConfigStore()
         self.manager = InstanceManager()
         self.manager.LAUNCH_COOLDOWN = self.config.cfg.launch_cooldown
+        self.manager.launch_mode = self.config.cfg.launch_mode
         self.manager.start()
 
         self._build_ui()
@@ -54,6 +55,21 @@ class App(tk.Tk):
         ttk.Button(top, text="Launch", command=self._on_launch).pack(side=tk.LEFT, padx=4)
         ttk.Button(top, text="Save Preset", command=self._on_save_preset).pack(side=tk.LEFT, padx=4)
         ttk.Button(top, text="Accounts…", command=self._open_account_manager).pack(side=tk.LEFT, padx=4)
+
+        mode_frame = ttk.Frame(self, padding=(10, 0))
+        mode_frame.pack(fill=tk.X)
+        ttk.Label(mode_frame, text="Launch mode:").pack(side=tk.LEFT)
+        self.mode_var = tk.StringVar(value=self.config.cfg.launch_mode)
+        ttk.Radiobutton(
+            mode_frame, text="Via Roblox launcher (stable, recommended)",
+            variable=self.mode_var, value="protocol",
+            command=self._on_mode_changed,
+        ).pack(side=tk.LEFT, padx=6)
+        ttk.Radiobutton(
+            mode_frame, text="Direct RobloxPlayerBeta (faster, may skip updates)",
+            variable=self.mode_var, value="direct",
+            command=self._on_mode_changed,
+        ).pack(side=tk.LEFT, padx=6)
 
         # Body: live instances on the left, saved presets on the right.
         body = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
@@ -92,7 +108,7 @@ class App(tk.Tk):
         ttk.Button(actions, text="Server Hop", command=self._on_hop).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Close Instance", command=self._on_close_instance).pack(side=tk.LEFT, padx=4)
 
-        self.status_var = tk.StringVar(value="Ready. Mutex held; ticket-authed launches bypass the official launcher.")
+        self.status_var = tk.StringVar(value="Ready. Mutex held; per-account auth tickets keep instances isolated.")
         ttk.Label(self, textvariable=self.status_var, anchor=tk.W, padding=(10, 4)).pack(fill=tk.X, side=tk.BOTTOM)
 
     # ---- helpers ---------------------------------------------------------
@@ -284,6 +300,16 @@ class App(tk.Tk):
             self._refresh_presets()
 
     # ---- lifecycle -------------------------------------------------------
+
+    def _on_mode_changed(self):
+        mode = self.mode_var.get()
+        self.manager.launch_mode = mode
+        self.config.cfg.launch_mode = mode
+        self.config.save()
+        self._set_status(
+            "Launches will go through RobloxPlayerLauncher." if mode == "protocol"
+            else "Launches will spawn RobloxPlayerBeta directly."
+        )
 
     def _open_account_manager(self):
         AccountManager(self, self.store, on_change=lambda: (self._refresh_accounts_dropdown(), self._refresh_presets()))

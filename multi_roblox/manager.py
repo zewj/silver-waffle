@@ -35,6 +35,11 @@ class InstanceManager:
     # Roblox throttles join attempts. Spacing launches avoids the
     # "joining too quickly" / "already running" errors.
     LAUNCH_COOLDOWN = 2.5
+    # How long to wait for a new RobloxPlayerBeta.exe to appear after a
+    # launch. Protocol mode goes through RobloxPlayerLauncher.exe which may
+    # run an update first, so we give it more headroom than direct exec.
+    PROTOCOL_PID_TIMEOUT = 90.0
+    DIRECT_PID_TIMEOUT = 30.0
     # Wait this long for the new client's window before killing the old one
     # during a server hop. Keeps the visible gap minimal.
     HOP_OVERLAP_TIMEOUT = 35.0
@@ -43,6 +48,8 @@ class InstanceManager:
         self._mutex = SingletonMutex()
         self._lock = threading.Lock()
         self._last_launch = 0.0
+        # Default. The GUI overrides this from the persisted config.
+        self.launch_mode = "protocol"
         self.instances: list[Instance] = []
 
     def start(self):
@@ -62,26 +69,52 @@ class InstanceManager:
             time.sleep(wait)
         self._last_launch = time.time()
 
-    def _launch_process(self, account: Optional[Account], place_id: int,
-                        job_id: Optional[str]) -> Optional[int]:
-        """Spawn one client, returning the resolved RobloxPlayerBeta PID."""
-        self._respect_cooldown()
-        before = windows.list_roblox_pids()
-        if account:
-            ticket = auth.fetch_auth_ticket(account.cookie())
-            launcher.launch_with_ticket(ticket, place_id, job_id=job_id)
-        else:
-            # Fallback: protocol handoff uses whatever account is signed in.
-            uri = servers.join_uri(place_id, job_id) if job_id else servers.launch_uri(place_id)
-            windows.launch_uri(uri)
-
-        deadline = time.time() + 45.0
+    def _wait_for_new_pid(self, before: set, timeout: float) -> Optional[int]:
+        deadline = time.time() + timeout
         while time.time() < deadline:
             diff = windows.list_roblox_pids() - before
             if diff:
                 return sorted(diff)[-1]
             time.sleep(0.4)
         return None
+
+    def _launch_process(self, account: Optional[Account], place_id: int,
+                        job_id: Optional[str]) -> Optional[int]:
+        """Spawn one client, returning the resolved RobloxPlayerBeta PID.
+
+        Protocol launches are preferred because RobloxPlayerLauncher handles
+        version updates and Hyperion's parent-process expectations. If the
+        protocol launch doesn't produce a new PID we fall back to direct
+        exec with a freshly minted ticket (auth tickets are single-use).
+        """
+        self._respect_cooldown()
+
+        if not account:
+            # No saved account → protocol handoff using whoever is signed in.
+            before = windows.list_roblox_pids()
+            uri = servers.join_uri(place_id, job_id) if job_id else servers.launch_uri(place_id)
+            windows.launch_uri(uri)
+            return self._wait_for_new_pid(before, self.PROTOCOL_PID_TIMEOUT)
+
+        if self.launch_mode == "direct":
+            before = windows.list_roblox_pids()
+            ticket = auth.fetch_auth_ticket(account.cookie())
+            launcher.launch_with_ticket(ticket, place_id, job_id=job_id)
+            return self._wait_for_new_pid(before, self.DIRECT_PID_TIMEOUT)
+
+        # protocol-first with direct fallback
+        before = windows.list_roblox_pids()
+        ticket = auth.fetch_auth_ticket(account.cookie())
+        launcher.launch_protocol_with_ticket(ticket, place_id, job_id=job_id)
+        pid = self._wait_for_new_pid(before, self.PROTOCOL_PID_TIMEOUT)
+        if pid:
+            return pid
+        # Protocol launch produced nothing; the first ticket is now consumed
+        # or expired, so mint a fresh one and try direct exec.
+        before = windows.list_roblox_pids()
+        ticket = auth.fetch_auth_ticket(account.cookie())
+        launcher.launch_with_ticket(ticket, place_id, job_id=job_id)
+        return self._wait_for_new_pid(before, self.DIRECT_PID_TIMEOUT)
 
     def add_instance(self, label: str, place_id: int,
                      account: Optional[Account] = None,
