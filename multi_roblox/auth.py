@@ -1,8 +1,11 @@
 """Roblox web-auth flows: CSRF, authentication tickets, identity lookup."""
+import logging
 import time
 from typing import Optional
 
 import requests
+
+log = logging.getLogger(__name__)
 
 _BASE_HEADERS = {
     "User-Agent": "Roblox/WinInet",
@@ -15,10 +18,12 @@ class AuthError(RuntimeError):
     pass
 
 
-def _session(cookie: str) -> requests.Session:
+def _session(cookie: str, proxy: Optional[str] = None) -> requests.Session:
     s = requests.Session()
     s.headers.update(_BASE_HEADERS)
     s.cookies.set(".ROBLOSECURITY", cookie, domain=".roblox.com")
+    if proxy:
+        s.proxies = {"http": proxy, "https": proxy}
     return s
 
 
@@ -31,9 +36,9 @@ def fetch_csrf_token(session: requests.Session) -> str:
     return token
 
 
-def whoami(cookie: str) -> dict:
+def whoami(cookie: str, proxy: Optional[str] = None) -> dict:
     """Validate a cookie and return {id, name, displayName}."""
-    s = _session(cookie)
+    s = _session(cookie, proxy=proxy)
     resp = s.get("https://users.roblox.com/v1/users/authenticated", timeout=10)
     if resp.status_code == 401:
         raise AuthError("Cookie rejected (401). Re-export .ROBLOSECURITY from the browser.")
@@ -41,9 +46,9 @@ def whoami(cookie: str) -> dict:
     return resp.json()
 
 
-def fetch_auth_ticket(cookie: str) -> str:
+def fetch_auth_ticket(cookie: str, proxy: Optional[str] = None) -> str:
     """Exchange a .ROBLOSECURITY cookie for a one-shot launch ticket."""
-    s = _session(cookie)
+    s = _session(cookie, proxy=proxy)
     csrf = fetch_csrf_token(s)
     headers = {
         "X-CSRF-TOKEN": csrf,
@@ -60,6 +65,7 @@ def fetch_auth_ticket(cookie: str) -> str:
     ticket = resp.headers.get("rbx-authentication-ticket")
     if not ticket:
         raise AuthError("No rbx-authentication-ticket header in response")
+    log.debug("minted auth ticket (proxy=%s)", bool(proxy))
     return ticket
 
 

@@ -31,6 +31,26 @@ server hopping that doesn't trip the "you are joining too quickly" errors.
 - **Encrypted cookie storage**: cookies are encrypted with DPAPI
   (`CryptProtectData`) so the on-disk file is only decryptable by your
   Windows user account.
+- **Per-account profile isolation**: every launch overrides
+  `LOCALAPPDATA` to a per-account directory under
+  `%APPDATA%\MultiRobloxManager\data\<user_id>\`. Cookies, cache, and
+  logs Roblox writes stay scoped to that account, reducing fingerprint
+  linkage. The real `Versions\` binary directory is exposed via an NTFS
+  junction so the launcher still finds the player exe.
+- **Per-account proxy**: each account can carry an `http://` or
+  `socks5://` proxy URL applied to Roblox's auth-ticket / identity calls.
+  (Game-client traffic still goes direct unless you also use a system
+  proxy — there's no per-process network namespace on Windows.)
+- **CPU/RAM stats + crash detection**: every running client is polled
+  via `psutil` ~1.5 s and shown in the table; if a PID disappears the
+  row turns red and the status flips to "crashed".
+- **Bulk actions**: Shift/Ctrl-click multiple rows to focus, hop, or
+  close them in one go.
+- **Rotating log file**: everything important goes to
+  `%APPDATA%\MultiRobloxManager\logs\manager.log` (2 MB × 5 backups);
+  there's an **Open Logs** button so you can grab it for bug reports.
+- **Roblox version awareness**: the detected client version is shown in
+  the status bar and logged so you can correlate breakage with updates.
 - **Focus + cycle**: per-instance focus button, plus `Ctrl+Tab` to cycle.
   Uses `AttachThreadInput` + `SetForegroundWindow` to defeat focus-stealing
   prevention.
@@ -135,25 +155,42 @@ Launches across the whole app are spaced by `launch_cooldown` (default
 ```
 main.py
 multi_roblox/
-  accounts.py        # AccountStore (DPAPI-encrypted cookies)
-  auth.py            # CSRF + authentication-ticket exchange
+  accounts.py        # AccountStore (DPAPI-encrypted cookies, proxy per account)
+  auth.py            # CSRF + authentication-ticket exchange (proxy-aware)
   browser_login.py   # Embedded webview sign-in (password / QR / passkey)
-  config.py          # Persistent presets / recent places / cooldown
+  config.py          # Persistent presets / recent places / cooldown / mode
   dpapi.py           # CryptProtectData / CryptUnprotectData wrappers
   gui.py             # Tkinter GUI
-  launcher.py        # Find RobloxPlayerBeta.exe; spawn with -t/-j
-  manager.py         # InstanceManager — mutex, launch, focus, hop
+  launcher.py        # Find launcher + player exes; spawn with env overrides
+  logging_setup.py   # Rotating log file + console handler
+  manager.py         # InstanceManager — mutex, launch, focus, hop, stats
   mutex.py           # SingletonMutex (ROBLOX_singletonEvent)
+  profiles.py        # Per-account LOCALAPPDATA isolation (mklink /J)
   servers.py         # Public server list, jobId picker, protocol URI builder
+  stats.py           # psutil-based CPU/RAM/liveness sampling
   windows.py         # Win32 helpers: PID list, window find/focus, kill
 ```
 
 ## Data locations
 
 - `%APPDATA%\MultiRobloxManager\accounts.json` — accounts (cookies
-  encrypted).
+  encrypted) + per-account proxy URL.
 - `%APPDATA%\MultiRobloxManager\config.json` — presets, recent places,
-  launch cooldown.
+  launch cooldown, launch mode.
+- `%APPDATA%\MultiRobloxManager\data\<user_id>\` — per-account isolated
+  Roblox `LOCALAPPDATA`. A `Roblox\Versions` junction inside points back
+  at the real binary directory.
+- `%APPDATA%\MultiRobloxManager\logs\manager.log` — rotating log file.
+
+## Known limitations / deliberately not built
+
+- **CustomTkinter port** — pure cosmetics; not done in this branch.
+- **Encrypted account export/import** — needs a passphrase-based key
+  derivation distinct from DPAPI (which is per-machine); future work.
+- **Per-instance VPN/proxy for game traffic** — Roblox's client doesn't
+  honor in-process proxy settings; that requires a system-level tool
+  like a per-process firewall rule, proxifier, or a WireGuard tunnel.
+  Per-account proxy here covers the auth / API calls only.
 
 ## Use responsibly
 

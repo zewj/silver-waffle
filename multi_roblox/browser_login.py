@@ -10,9 +10,12 @@ cookie on stdout — that keeps it isolated from the Tk main loop.
 from __future__ import annotations
 
 import http.cookies
+import logging
 import subprocess
 import sys
 from typing import Optional
+
+log = logging.getLogger(__name__)
 
 LOGIN_URL = "https://www.roblox.com/login"
 # Roblox redirects to /home (and sometimes the discover/dashboard pages)
@@ -74,19 +77,21 @@ def _run_webview():
         try:
             url = window.get_current_url() or ""
         except Exception:
+            log.exception("could not read current url from webview")
             return
         if not any(hint in url for hint in POST_LOGIN_HINTS):
             return
         try:
             cookie = _extract_cookie(window.get_cookies())
         except Exception:
+            log.exception("could not read cookies from webview")
             return
         if cookie:
             captured.append(cookie)
             try:
                 window.destroy()
             except Exception:
-                pass
+                log.exception("could not destroy webview window cleanly")
 
     window = webview.create_window(
         "Sign in to Roblox",

@@ -1,14 +1,20 @@
 """Tkinter UI for the multi-instance manager."""
+import logging
+import os
+import subprocess
 import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from . import browser_login, servers
+from . import browser_login, launcher, logging_setup, servers
 from .accounts import AccountStore
 from .config import ConfigStore, Preset
 from .manager import InstanceManager
 
+log = logging.getLogger(__name__)
+
 _NO_ACCOUNT = "(launcher's signed-in account)"
+_STATS_REFRESH_MS = 1500
 
 
 class App(tk.Tk):
@@ -18,6 +24,9 @@ class App(tk.Tk):
         self.geometry("960x600")
         self.minsize(820, 480)
 
+        self.log_path = logging_setup.setup()
+        log.info("Multi Roblox Manager starting; log file at %s", self.log_path)
+
         self.store = AccountStore()
         self.config = ConfigStore()
         self.manager = InstanceManager()
@@ -25,10 +34,14 @@ class App(tk.Tk):
         self.manager.launch_mode = self.config.cfg.launch_mode
         self.manager.start()
 
+        self.roblox_version = launcher.detect_version() or "unknown"
+        log.info("detected Roblox version: %s", self.roblox_version)
+
         self._build_ui()
         self._refresh_accounts_dropdown()
         self._refresh_presets()
         self._refresh_tree()
+        self._schedule_stats_refresh()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind_all("<Control-Tab>", lambda _e: self._cycle())
@@ -75,20 +88,24 @@ class App(tk.Tk):
         body = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 4))
 
-        live_frame = ttk.LabelFrame(body, text="Running instances", padding=6)
+        live_frame = ttk.LabelFrame(body, text="Running instances (Ctrl/Shift-click for bulk)", padding=6)
         body.add(live_frame, weight=3)
-        cols = ("label", "account", "place", "pid", "job")
-        self.tree = ttk.Treeview(live_frame, columns=cols, show="headings", selectmode="browse")
+        cols = ("label", "account", "place", "pid", "status", "cpu", "ram", "job")
+        self.tree = ttk.Treeview(live_frame, columns=cols, show="headings", selectmode="extended")
         for col, head, w in (
-            ("label", "Label", 130),
-            ("account", "Account", 150),
-            ("place", "Place ID", 100),
-            ("pid", "PID", 70),
-            ("job", "Server (jobId)", 280),
+            ("label", "Label", 120),
+            ("account", "Account", 140),
+            ("place", "Place ID", 90),
+            ("pid", "PID", 60),
+            ("status", "Status", 80),
+            ("cpu", "CPU %", 60),
+            ("ram", "RAM MB", 70),
+            ("job", "Server (jobId)", 240),
         ):
             self.tree.heading(col, text=head)
             self.tree.column(col, width=w, anchor=tk.W)
         self.tree.pack(fill=tk.BOTH, expand=True)
+        self.tree.tag_configure("crashed", foreground="#aa0000")
 
         preset_frame = ttk.LabelFrame(body, text="Saved presets (persist across restarts)", padding=6)
         body.add(preset_frame, weight=2)
@@ -106,9 +123,13 @@ class App(tk.Tk):
         ttk.Button(actions, text="Focus", command=self._on_focus).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Cycle (Ctrl+Tab)", command=self._cycle).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Server Hop", command=self._on_hop).pack(side=tk.LEFT, padx=4)
-        ttk.Button(actions, text="Close Instance", command=self._on_close_instance).pack(side=tk.LEFT, padx=4)
+        ttk.Button(actions, text="Close", command=self._on_close_instance).pack(side=tk.LEFT, padx=4)
+        ttk.Button(actions, text="Open Logs", command=self._open_logs).pack(side=tk.RIGHT, padx=4)
 
-        self.status_var = tk.StringVar(value="Ready. Mutex held; per-account auth tickets keep instances isolated.")
+        self.status_var = tk.StringVar(value=(
+            f"Ready. Roblox {self.roblox_version} detected; mutex held; "
+            f"per-account ticket auth + LOCALAPPDATA isolation enabled."
+        ))
         ttk.Label(self, textvariable=self.status_var, anchor=tk.W, padding=(10, 4)).pack(fill=tk.X, side=tk.BOTTOM)
 
     # ---- helpers ---------------------------------------------------------
@@ -134,19 +155,27 @@ class App(tk.Tk):
             return None
         return next((a for a in self.store if a.label() == choice), None)
 
+    def _selected_instances(self):
+        out = []
+        for iid in self.tree.selection():
+            idx = self.tree.index(iid)
+            try:
+                out.append(self.manager.instances[idx])
+            except IndexError:
+                continue
+        return out
+
     def _selected_instance(self):
-        sel = self.tree.selection()
-        if not sel:
-            return None
-        idx = self.tree.index(sel[0])
-        try:
-            return self.manager.instances[idx]
-        except IndexError:
-            return None
+        sel = self._selected_instances()
+        return sel[0] if sel else None
 
     def _refresh_tree(self):
         self.tree.delete(*self.tree.get_children())
         for inst in self.manager.instances:
+            s = inst.last_sample
+            cpu = f"{s.cpu_percent:.0f}" if s.alive else "-"
+            ram = f"{s.rss_mb:.0f}" if s.alive else "-"
+            tags = ("crashed",) if inst.status == "crashed" else ()
             self.tree.insert(
                 "", tk.END,
                 values=(
@@ -154,9 +183,28 @@ class App(tk.Tk):
                     inst.account.label() if inst.account else _NO_ACCOUNT,
                     inst.place_id,
                     inst.pid or "-",
+                    inst.status,
+                    cpu,
+                    ram,
                     inst.job_id or "-",
                 ),
+                tags=tags,
             )
+
+    def _schedule_stats_refresh(self):
+        try:
+            self.manager.refresh_stats()
+            self._refresh_tree()
+        except Exception:
+            log.exception("stats refresh failed")
+        self.after(_STATS_REFRESH_MS, self._schedule_stats_refresh)
+
+    def _open_logs(self):
+        try:
+            os.startfile(str(self.log_path.parent))
+        except Exception as e:
+            log.exception("could not open log folder")
+            messagebox.showerror("Logs", f"Could not open {self.log_path.parent}: {e}")
 
     def _set_status(self, msg):
         self.status_var.set(msg)
@@ -209,24 +257,37 @@ class App(tk.Tk):
             self._set_status(f"Focused {target.label}")
 
     def _on_hop(self):
-        inst = self._selected_instance()
-        if not inst:
+        targets = self._selected_instances()
+        if not targets:
             return
-        self._set_status(f"Server-hopping {inst.label}…")
+        self._set_status(f"Server-hopping {len(targets)} instance(s)…")
+
+        def run_all():
+            results = []
+            for inst in targets:
+                try:
+                    job = self.manager.server_hop(inst)
+                    results.append((inst.label, job or "(no server)"))
+                except Exception as e:
+                    log.exception("hop failed for %s", inst.label)
+                    results.append((inst.label, f"error: {e}"))
+            return results
+
         self._run_async(
-            lambda: self.manager.server_hop(inst),
-            on_done=lambda job: self._set_status(
-                f"{inst.label} hopped to {job}" if job else f"{inst.label}: no eligible server found"
+            run_all,
+            on_done=lambda results: self._set_status(
+                "Hop done: " + ", ".join(f"{lbl}→{j}" for lbl, j in results)
             ),
         )
 
     def _on_close_instance(self):
-        inst = self._selected_instance()
-        if not inst:
+        targets = self._selected_instances()
+        if not targets:
             return
-        self.manager.close(inst)
+        for inst in targets:
+            self.manager.close(inst)
         self._refresh_tree()
-        self._set_status(f"Closed {inst.label}")
+        self._set_status(f"Closed {len(targets)} instance(s).")
 
     # ---- preset actions --------------------------------------------------
 
@@ -334,30 +395,43 @@ class AccountManager(tk.Toplevel):
         self.store = store
         self.on_change = on_change
 
-        cols = ("nickname", "username", "user_id")
+        cols = ("nickname", "username", "user_id", "proxy")
         self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="browse")
-        for col, head, w in (("nickname", "Nickname", 160), ("username", "Username", 200), ("user_id", "User ID", 120)):
+        for col, head, w in (
+            ("nickname", "Nickname", 140),
+            ("username", "Username", 160),
+            ("user_id", "User ID", 90),
+            ("proxy", "Proxy", 200),
+        ):
             self.tree.heading(col, text=head)
             self.tree.column(col, width=w, anchor=tk.W)
         self.tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.tree.bind("<<TreeviewSelect>>", self._on_select_row)
 
         form = ttk.Frame(self, padding=(10, 0))
         form.pack(fill=tk.X)
         ttk.Label(form, text="Nickname (optional):").grid(row=0, column=0, sticky=tk.W)
         self.nickname_var = tk.StringVar()
         ttk.Entry(form, textvariable=self.nickname_var, width=24).grid(row=0, column=1, sticky=tk.W, padx=6)
+        ttk.Label(form, text="Proxy URL (optional):").grid(row=0, column=2, sticky=tk.W)
+        self.proxy_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self.proxy_var, width=32).grid(row=0, column=3, sticky=tk.W, padx=6)
         ttk.Label(form, text=".ROBLOSECURITY cookie:").grid(row=1, column=0, sticky=tk.NW, pady=(6, 0))
         self.cookie_text = tk.Text(form, height=4, width=60, wrap=tk.WORD)
-        self.cookie_text.grid(row=1, column=1, sticky=tk.W, padx=6, pady=(6, 0))
+        self.cookie_text.grid(row=1, column=1, columnspan=3, sticky=tk.W, padx=6, pady=(6, 0))
 
         btns = ttk.Frame(self, padding=10)
         btns.pack(fill=tk.X)
         ttk.Button(btns, text="Add / Update", command=self._on_add).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Sign in with Browser…", command=self._on_browser_login).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Update Proxy", command=self._on_update_proxy).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Remove Selected", command=self._on_remove).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Close", command=self.destroy).pack(side=tk.RIGHT, padx=4)
 
-        self.status_var = tk.StringVar(value="Paste the .ROBLOSECURITY cookie, or click 'Sign in with Browser…' to use password / QR / passkey via Roblox's own login page.")
+        self.status_var = tk.StringVar(value=(
+            "Proxy URL (e.g. http://user:pass@host:port or socks5://host:port) is applied to Roblox auth calls only;"
+            " game-client traffic still routes directly unless you also have a system-wide proxy."
+        ))
         ttk.Label(self, textvariable=self.status_var, anchor=tk.W, padding=(10, 4), wraplength=560, justify=tk.LEFT).pack(fill=tk.X, side=tk.BOTTOM)
 
         self._refresh()
@@ -366,9 +440,28 @@ class AccountManager(tk.Toplevel):
         self.tree.delete(*self.tree.get_children())
         for acc in self.store:
             self.tree.insert("", tk.END, iid=str(acc.user_id),
-                             values=(acc.nickname, acc.username, acc.user_id))
+                             values=(acc.nickname, acc.username, acc.user_id, acc.proxy or "-"))
         if self.on_change:
             self.on_change()
+
+    def _on_select_row(self, _event=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        acc = self.store.find(int(sel[0]))
+        if acc:
+            self.nickname_var.set(acc.nickname)
+            self.proxy_var.set(acc.proxy)
+
+    def _on_update_proxy(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Select", "Select an account row first.")
+            return
+        user_id = int(sel[0])
+        self.store.update_proxy(user_id, self.proxy_var.get().strip())
+        self.status_var.set("Proxy updated.")
+        self._refresh()
 
     def _on_add(self):
         cookie = self.cookie_text.get("1.0", tk.END).strip()
@@ -376,16 +469,19 @@ class AccountManager(tk.Toplevel):
             messagebox.showwarning("Missing", "Paste your .ROBLOSECURITY cookie.")
             return
         nickname = self.nickname_var.get().strip()
+        proxy = self.proxy_var.get().strip()
         self.status_var.set("Validating cookie with Roblox…")
         self.update_idletasks()
         try:
-            acc = self.store.add_or_update(cookie, nickname=nickname)
+            acc = self.store.add_or_update(cookie, nickname=nickname, proxy=proxy)
         except Exception as e:
+            log.exception("account validation failed")
             messagebox.showerror("Validation failed", str(e))
             self.status_var.set(f"Error: {e}")
             return
         self.cookie_text.delete("1.0", tk.END)
         self.nickname_var.set("")
+        self.proxy_var.set("")
         self.status_var.set(f"Saved {acc.label()} (user {acc.user_id}).")
         self._refresh()
 
@@ -405,26 +501,29 @@ class AccountManager(tk.Toplevel):
             messagebox.showinfo("pywebview required", browser_login.install_hint())
             return
         nickname = self.nickname_var.get().strip()
+        proxy = self.proxy_var.get().strip()
         self.status_var.set("Opening Roblox sign-in window… complete sign-in (password, QR, or passkey).")
         self.update_idletasks()
 
         def worker():
             cookie = browser_login.harvest_via_subprocess()
-            self.after(0, lambda: self._finish_browser_login(cookie, nickname))
+            self.after(0, lambda: self._finish_browser_login(cookie, nickname, proxy))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_browser_login(self, cookie, nickname):
+    def _finish_browser_login(self, cookie, nickname, proxy):
         if not cookie:
             self.status_var.set("Sign-in cancelled or failed before a cookie was captured.")
             return
         try:
-            acc = self.store.add_or_update(cookie, nickname=nickname)
+            acc = self.store.add_or_update(cookie, nickname=nickname, proxy=proxy)
         except Exception as e:
+            log.exception("account validation after browser login failed")
             messagebox.showerror("Validation failed", str(e))
             self.status_var.set(f"Error: {e}")
             return
         self.nickname_var.set("")
+        self.proxy_var.set("")
         self.status_var.set(f"Signed in as {acc.label()} (user {acc.user_id}).")
         self._refresh()
 
