@@ -204,7 +204,14 @@ class InstanceManager:
         return affected
 
     def server_hop(self, inst: Instance) -> Optional[str]:
-        srv = servers.pick_server(inst.place_id, exclude_job_ids=inst.recent_jobs)
+        # Route the server-list lookup through the account's proxy too, so
+        # the IP discovering the candidate list matches the IP that'll
+        # ultimately join. Otherwise a SOCKS5'd account would fetch from
+        # the local egress and then connect from the proxy egress.
+        proxy = inst.account.proxy_or_none() if inst.account else None
+        srv = servers.pick_server(
+            inst.place_id, exclude_job_ids=inst.recent_jobs, proxy=proxy,
+        )
         if not srv:
             log.info("hop: no eligible server for place %s", inst.place_id)
             return None

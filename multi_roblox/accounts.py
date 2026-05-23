@@ -79,6 +79,10 @@ class AccountStore:
     def add_or_update(self, cookie: str, nickname: str = "",
                       proxy: str = "") -> Account:
         """Validate the cookie, then persist (replacing any existing entry)."""
+        # Catch bad proxy URLs (typo'd scheme, missing PySocks for socks://)
+        # here so the user sees one clear message instead of a confusing
+        # requests traceback halfway through the cookie validation.
+        proxy = auth.validate_proxy_url(proxy)
         info = auth.whoami(cookie, proxy=proxy or None)
         encrypted = base64.b64encode(dpapi.protect(cookie.encode("utf-8"))).decode("ascii")
         acc = Account(
@@ -98,6 +102,7 @@ class AccountStore:
         return acc
 
     def update_proxy(self, user_id: int, proxy: str):
+        proxy = auth.validate_proxy_url(proxy)
         with self._lock:
             for a in self.accounts:
                 if a.user_id == user_id:

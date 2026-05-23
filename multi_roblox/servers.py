@@ -19,15 +19,26 @@ def parse_place_id(value: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
-def fetch_servers(place_id: int, limit: int = 100, sort: str = "Asc"):
-    """Return the public servers list for a place. Raises on network failure."""
+def fetch_servers(place_id: int, limit: int = 100, sort: str = "Asc",
+                  proxy: Optional[str] = None):
+    """Return the public servers list for a place. Raises on network failure.
+
+    If `proxy` is given, the request is routed through it. We pass it via
+    the per-call `proxies=` kwarg rather than mutating the module-level
+    session, so different callers can use different proxies safely.
+    """
     url = f"https://games.roblox.com/v1/games/{place_id}/servers/Public"
-    resp = _SESSION.get(url, params={"sortOrder": sort, "limit": limit}, timeout=10)
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    resp = _SESSION.get(
+        url, params={"sortOrder": sort, "limit": limit},
+        timeout=10, proxies=proxies,
+    )
     resp.raise_for_status()
     return resp.json().get("data", [])
 
 
-def pick_server(place_id: int, exclude_job_ids=()) -> Optional[dict]:
+def pick_server(place_id: int, exclude_job_ids=(),
+                proxy: Optional[str] = None) -> Optional[dict]:
     """Choose a non-full public server that isn't in the exclude set.
 
     Prefers servers with the most headroom but at least one player, which gives
@@ -35,7 +46,7 @@ def pick_server(place_id: int, exclude_job_ids=()) -> Optional[dict]:
     """
     exclude = set(exclude_job_ids or ())
     candidates = []
-    for srv in fetch_servers(place_id):
+    for srv in fetch_servers(place_id, proxy=proxy):
         job_id = srv.get("id")
         if not job_id or job_id in exclude:
             continue

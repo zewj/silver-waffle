@@ -1,6 +1,7 @@
 """Roblox web-auth flows: CSRF, authentication tickets, identity lookup."""
 import logging
 import time
+import urllib.parse
 from typing import Optional
 
 import requests
@@ -13,9 +14,48 @@ _BASE_HEADERS = {
     "Origin": "https://www.roblox.com",
 }
 
+# Proxy URL schemes we accept. SOCKS variants are routed by `requests`
+# via PySocks, which `requests` imports lazily the first time a
+# socks*:// URL is used.
+_SUPPORTED_PROXY_SCHEMES = {
+    "http", "https",
+    "socks5", "socks5h",  # h = hostname resolution through the proxy
+    "socks4", "socks4a",
+}
+
 
 class AuthError(RuntimeError):
     pass
+
+
+def validate_proxy_url(url: Optional[str]) -> str:
+    """Strip + validate a proxy URL. Returns the URL or raises ValueError.
+
+    Empty / None is treated as "no proxy" and returns ''. SOCKS schemes
+    additionally require PySocks; we surface a friendlier message if it's
+    missing instead of letting `requests` raise its generic error mid-call.
+    """
+    url = (url or "").strip()
+    if not url:
+        return ""
+    parsed = urllib.parse.urlparse(url)
+    scheme = parsed.scheme.lower()
+    if scheme not in _SUPPORTED_PROXY_SCHEMES:
+        raise ValueError(
+            f"Unsupported proxy scheme {scheme!r}. "
+            "Use http://, https://, socks5://, socks5h://, or socks4://."
+        )
+    if not parsed.hostname:
+        raise ValueError("Proxy URL is missing a host")
+    if scheme.startswith("socks"):
+        try:
+            import socks  # noqa: F401  (PySocks)
+        except ImportError as e:
+            raise ValueError(
+                "SOCKS proxy support needs PySocks. "
+                "Install with: pip install PySocks"
+            ) from e
+    return url
 
 
 def _session(cookie: str, proxy: Optional[str] = None) -> requests.Session:

@@ -25,6 +25,8 @@ echo Building MultiRobloxManager.exe...
     --collect-submodules shiboken6 ^
     --collect-all pywebview ^
     --collect-all psutil ^
+    --hidden-import socks ^
+    --hidden-import urllib3.contrib.socks ^
     --exclude-module PyQt5 ^
     --exclude-module PyQt6 ^
     main.py || goto :fail

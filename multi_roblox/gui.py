@@ -971,7 +971,9 @@ class AccountManagerDialog(QDialog):
         fl.addWidget(self.nickname_edit, 0, 1)
         fl.addWidget(QLabel("Proxy URL (optional)"), 0, 2)
         self.proxy_edit = QLineEdit()
-        self.proxy_edit.setPlaceholderText("http://user:pass@host:port or socks5://host:port")
+        self.proxy_edit.setPlaceholderText(
+            "http(s)://user:pass@host:port or socks5://user:pass@host:port"
+        )
         fl.addWidget(self.proxy_edit, 0, 3)
         fl.setColumnStretch(1, 1)
         fl.setColumnStretch(3, 1)

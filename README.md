@@ -37,10 +37,14 @@ server hopping that doesn't trip the "you are joining too quickly" errors.
   logs Roblox writes stay scoped to that account, reducing fingerprint
   linkage. The real `Versions\` binary directory is exposed via an NTFS
   junction so the launcher still finds the player exe.
-- **Per-account proxy**: each account can carry an `http://` or
-  `socks5://` proxy URL applied to Roblox's auth-ticket / identity calls.
-  (Game-client traffic still goes direct unless you also use a system
-  proxy — there's no per-process network namespace on Windows.)
+- **Per-account proxy (HTTP / HTTPS / SOCKS5)**: each account carries
+  its own proxy URL applied to Roblox's auth-ticket / identity / server-
+  list calls. Supports `http://`, `https://`, `socks5://`, `socks5h://`
+  (DNS through proxy), and `socks4://`. SOCKS variants route via
+  `PySocks`; the manager validates the URL on save and surfaces a clear
+  error if PySocks is missing or the scheme is bad. (Game-client traffic
+  still goes direct unless you also use a system proxy — there's no
+  per-process network namespace on Windows.)
 - **CPU/RAM stats + crash detection**: every running client is polled
   via `psutil` ~1.5 s and shown in the table; if a PID disappears the
   row turns red and the status flips to "crashed".

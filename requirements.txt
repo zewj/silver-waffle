@@ -1,4 +1,8 @@
 requests>=2.31.0
+# SOCKS proxy backend for `requests`. Enables socks5://, socks5h://,
+# socks4:// proxy URLs on per-account proxies. requests imports this
+# lazily only when a SOCKS URL is used.
+PySocks>=1.7.1
 # Per-instance CPU / RAM stats and crash detection.
 psutil>=5.9
 # Qt bindings — modern GUI, native DPI, real animations.
