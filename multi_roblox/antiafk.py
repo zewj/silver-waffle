@@ -9,9 +9,15 @@ Per cycle (random 12–35 s) we:
   * Post a `WM_MOUSEMOVE` with a 5–15 px jitter around the client-area
     center. Roblox's input layer treats this as movement, which resets
     its 20-minute idle timer.
-  * Every few cycles, post a benign `WM_KEYDOWN`/`WM_KEYUP` for the `0`
-    key (no default Roblox binding) as a second signal — some game
-    builds dismiss the idle prompt via keyboard input only.
+  * Every few cycles, post a benign `WM_KEYDOWN`/`WM_KEYUP` for the
+    `F15` key — a "dead" function key almost no game binds — as a
+    second signal for game builds that only watch keyboard input.
+
+The ticker **auto-pauses whenever the target window is the foreground
+window**. If you're actively in that Roblox instance (intense PvP, 1v1,
+clicking around), the synthetic input doesn't fire and can't clash
+with your real actions. Your live input is already keeping Roblox's
+idle timer reset, so nothing's lost.
 
 Each instance has its own `AntiAFK` thread; the thread sleeps almost
 all the time so dozens of them are still effectively zero-CPU.
@@ -35,8 +41,12 @@ WM_MOUSEMOVE = 0x0200
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 
-# Virtual-key for the digit 0; not bound to any default Roblox action.
-VK_0 = 0x30
+# Virtual-key for F15 — a function key practically no Roblox game binds.
+# Chosen over digits (0-9) because PvP games routinely bind number keys to
+# weapon slots / abilities and a stray press could cause a real misinput.
+VK_F15 = 0x7E
+# Scan code for F15.
+SCAN_F15 = 0x68
 
 # Default cycle bounds (seconds).
 DEFAULT_INTERVAL_MIN = 12.0
@@ -46,8 +56,10 @@ DEFAULT_INTERVAL_MAX = 35.0
 MOVE_MIN = 5
 MOVE_MAX = 15
 
-# Keystroke fires every Nth cycle.
-KEYSTROKE_EVERY = 3
+# Keystroke fires every Nth cycle. Mouse jitter alone resets Roblox's
+# engine-level idle timer, so the keystroke is belt-and-suspenders and
+# can fire less often to further reduce any clash risk.
+KEYSTROKE_EVERY = 5
 
 
 def _make_lparam_coord(x: int, y: int) -> int:
@@ -107,10 +119,20 @@ class AntiAFK:
         log.info("anti-AFK stop requested for %s", self._label)
 
     def _resolve_hwnd(self) -> Optional[int]:
+        """Return the live HWND, or None if we should skip this cycle.
+
+        Returns None when the target is the current foreground window —
+        the user is actively playing that instance, their real input is
+        already resetting Roblox's idle timer, and firing synthetic
+        input now could collide with their actions in intense moments
+        (PvP, 1v1, etc.).
+        """
         hwnd = self._lookup()
-        if hwnd and windows._user32.IsWindow(hwnd):
-            return hwnd
-        return None
+        if not hwnd or not windows._user32.IsWindow(hwnd):
+            return None
+        if windows._user32.GetForegroundWindow() == hwnd:
+            return None
+        return hwnd
 
     def _send_jitter(self, hwnd: int) -> None:
         center = _client_center(hwnd)
@@ -124,17 +146,17 @@ class AntiAFK:
     def _send_benign_keystroke(self, hwnd: int) -> None:
         # lParam fields encoded per the WM_KEYDOWN docs:
         #   bits 0-15: repeat count (1)
-        #   bits 16-23: scan code for '0' (0x0B)
+        #   bits 16-23: scan code (F15)
         #   bit 24: extended key (0)
         #   bit 30: previous state (0 down / 1 up)
         #   bit 31: transition (0 down / 1 up)
-        down_lparam = (0x0B << 16) | 1
+        down_lparam = (SCAN_F15 << 16) | 1
         up_lparam = down_lparam | (1 << 30) | (1 << 31)
-        windows._user32.PostMessageW(hwnd, WM_KEYDOWN, VK_0, down_lparam)
+        windows._user32.PostMessageW(hwnd, WM_KEYDOWN, VK_F15, down_lparam)
         # A tiny wait between down/up makes the event look real to handlers
         # that filter zero-duration presses.
         time.sleep(0.04 + random.random() * 0.05)
-        windows._user32.PostMessageW(hwnd, WM_KEYUP, VK_0, up_lparam)
+        windows._user32.PostMessageW(hwnd, WM_KEYUP, VK_F15, up_lparam)
 
     def _loop(self) -> None:
         # Stagger first tick so a batch of "Enable on All" doesn't fire in lockstep.

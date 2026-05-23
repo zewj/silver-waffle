@@ -53,12 +53,15 @@ server hopping that doesn't trip the "you are joining too quickly" errors.
   the status bar and logged so you can correlate breakage with updates.
 - **Per-instance Anti-AFK**: each row has an *Anti-AFK* column you can
   click to toggle, plus **Enable Anti-AFK on All** / **Disable on All**
-  buttons. Activity (5–15 px mouse jitter around the client area center
-  plus an occasional benign `0` keystroke) is `PostMessageW`-ed straight
-  to the background Roblox HWND every 12–35 s with randomization, so
-  your foreground app keeps focus and overnight runs stay quiet — each
-  worker sleeps almost the entire interval, so dozens of workers idle at
-  effectively zero CPU.
+  buttons. Activity (5–15 px mouse jitter around the client area center,
+  plus an occasional `F15` keystroke — a dead function key no game binds)
+  is `PostMessageW`-ed straight to the background Roblox HWND every
+  12–35 s with randomization. **Auto-pauses whenever the target window
+  is the foreground window**, so if you're actively in that instance
+  (intense PvP, 1v1, etc.) the synthetic input never fires and can't
+  cause a misinput — your real input is already keeping Roblox awake.
+  Each worker sleeps almost the entire interval, so dozens of them idle
+  at effectively zero CPU.
 - **Focus + cycle**: per-instance focus button, plus `Ctrl+Tab` to cycle.
   Uses `AttachThreadInput` + `SetForegroundWindow` to defeat focus-stealing
   prevention.
