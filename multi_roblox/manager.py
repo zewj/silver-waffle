@@ -4,7 +4,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from . import servers, windows
+from . import auth, launcher, servers, windows
+from .accounts import Account
 from .mutex import SingletonMutex
 
 
@@ -12,6 +13,7 @@ from .mutex import SingletonMutex
 class Instance:
     label: str
     place_id: int
+    account: Optional[Account] = None
     pid: Optional[int] = None
     hwnd: Optional[int] = None
     job_id: Optional[str] = None
@@ -30,9 +32,12 @@ class Instance:
 class InstanceManager:
     """Owns the singleton mutex and the set of launched instances."""
 
-    # Roblox throttles join attempts; spacing launches avoids 'too many attempts'
-    # style errors when stacking instances or hopping quickly.
+    # Roblox throttles join attempts. Spacing launches avoids the
+    # "joining too quickly" / "already running" errors.
     LAUNCH_COOLDOWN = 2.5
+    # Wait this long for the new client's window before killing the old one
+    # during a server hop. Keeps the visible gap minimal.
+    HOP_OVERLAP_TIMEOUT = 35.0
 
     def __init__(self):
         self._mutex = SingletonMutex()
@@ -57,33 +62,40 @@ class InstanceManager:
             time.sleep(wait)
         self._last_launch = time.time()
 
-    def add_instance(self, label: str, place_id: int, job_id: Optional[str] = None) -> Instance:
-        inst = Instance(label=label, place_id=place_id)
-        with self._lock:
-            self.instances.append(inst)
-        self._launch_into(inst, job_id)
-        return inst
-
-    def _launch_into(self, inst: Instance, job_id: Optional[str]):
+    def _launch_process(self, account: Optional[Account], place_id: int,
+                        job_id: Optional[str]) -> Optional[int]:
+        """Spawn one client, returning the resolved RobloxPlayerBeta PID."""
         self._respect_cooldown()
         before = windows.list_roblox_pids()
-        uri = servers.join_uri(inst.place_id, job_id) if job_id else servers.launch_uri(inst.place_id)
-        windows.launch_uri(uri)
-        inst.remember_job(job_id) if job_id else None
+        if account:
+            ticket = auth.fetch_auth_ticket(account.cookie())
+            launcher.launch_with_ticket(ticket, place_id, job_id=job_id)
+        else:
+            # Fallback: protocol handoff uses whatever account is signed in.
+            uri = servers.join_uri(place_id, job_id) if job_id else servers.launch_uri(place_id)
+            windows.launch_uri(uri)
 
-        # Wait for the new RobloxPlayerBeta.exe to appear (launcher spawns it).
         deadline = time.time() + 45.0
-        new_pid = None
         while time.time() < deadline:
-            after = windows.list_roblox_pids()
-            diff = after - before
+            diff = windows.list_roblox_pids() - before
             if diff:
-                new_pid = sorted(diff)[-1]
-                break
-            time.sleep(0.5)
-        inst.pid = new_pid
-        if new_pid:
-            inst.hwnd = windows.find_window_for_pid(new_pid, timeout=30.0)
+                return sorted(diff)[-1]
+            time.sleep(0.4)
+        return None
+
+    def add_instance(self, label: str, place_id: int,
+                     account: Optional[Account] = None,
+                     job_id: Optional[str] = None) -> Instance:
+        inst = Instance(label=label, place_id=place_id, account=account)
+        with self._lock:
+            self.instances.append(inst)
+        pid = self._launch_process(account, place_id, job_id)
+        inst.pid = pid
+        if pid:
+            inst.hwnd = windows.find_window_for_pid(pid, timeout=30.0)
+        if job_id:
+            inst.remember_job(job_id)
+        return inst
 
     def focus(self, inst: Instance) -> bool:
         if not inst.hwnd and inst.pid:
@@ -98,21 +110,27 @@ class InstanceManager:
                 self.instances.remove(inst)
 
     def server_hop(self, inst: Instance) -> Optional[str]:
-        """Kill the instance and relaunch into a fresh public server.
+        """Overlap-style hop: bring the new client up before killing the old.
 
-        Returns the new jobId on success, None if no server was available.
+        The new RobloxPlayerBeta gets its own auth ticket and joins the chosen
+        public server directly. We only terminate the previous PID once the
+        new window appears (or after a timeout), which avoids the
+        "Roblox closed and reopened" flash of a kill-then-relaunch hop.
+        Returns the new jobId on success.
         """
         srv = servers.pick_server(inst.place_id, exclude_job_ids=inst.recent_jobs)
         if not srv:
             return None
-        if inst.pid:
-            windows.kill_pid(inst.pid)
-            inst.pid = None
-            inst.hwnd = None
-            # Give the OS a moment to tear down the process before relaunch.
-            time.sleep(1.0)
-        self._launch_into(inst, srv["id"])
-        return srv["id"]
+        new_job = srv["id"]
+        old_pid = inst.pid
+        new_pid = self._launch_process(inst.account, inst.place_id, new_job)
+        new_hwnd = windows.find_window_for_pid(new_pid, timeout=self.HOP_OVERLAP_TIMEOUT) if new_pid else None
+        if old_pid:
+            windows.kill_pid(old_pid)
+        inst.pid = new_pid
+        inst.hwnd = new_hwnd or (windows.find_window_for_pid(new_pid, timeout=5.0) if new_pid else None)
+        inst.remember_job(new_job)
+        return new_job
 
     def cycle_focus(self) -> Optional[Instance]:
         """Rotate keyboard focus to the next live instance."""

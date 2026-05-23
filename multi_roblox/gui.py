@@ -4,20 +4,25 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from . import servers
+from .accounts import AccountStore
 from .manager import InstanceManager
+
+_NO_ACCOUNT = "(launcher's signed-in account)"
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Multi Roblox Manager")
-        self.geometry("760x440")
-        self.minsize(680, 360)
+        self.geometry("820x520")
+        self.minsize(720, 420)
 
+        self.store = AccountStore()
         self.manager = InstanceManager()
         self.manager.start()
 
         self._build_ui()
+        self._refresh_accounts_dropdown()
         self._refresh_tree()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -29,21 +34,28 @@ class App(tk.Tk):
 
         ttk.Label(top, text="Game (placeId or URL):").pack(side=tk.LEFT)
         self.place_var = tk.StringVar()
-        ttk.Entry(top, textvariable=self.place_var, width=42).pack(side=tk.LEFT, padx=6)
+        ttk.Entry(top, textvariable=self.place_var, width=36).pack(side=tk.LEFT, padx=6)
+
+        ttk.Label(top, text="Account:").pack(side=tk.LEFT)
+        self.account_var = tk.StringVar()
+        self.account_combo = ttk.Combobox(top, textvariable=self.account_var, width=22, state="readonly")
+        self.account_combo.pack(side=tk.LEFT, padx=6)
 
         ttk.Label(top, text="Label:").pack(side=tk.LEFT)
         self.label_var = tk.StringVar()
-        ttk.Entry(top, textvariable=self.label_var, width=14).pack(side=tk.LEFT, padx=6)
+        ttk.Entry(top, textvariable=self.label_var, width=12).pack(side=tk.LEFT, padx=6)
 
         ttk.Button(top, text="Launch", command=self._on_launch).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text="Accounts…", command=self._open_account_manager).pack(side=tk.LEFT, padx=4)
 
-        cols = ("label", "place", "pid", "job")
+        cols = ("label", "account", "place", "pid", "job")
         self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="browse")
         for col, head, w in (
-            ("label", "Label", 140),
-            ("place", "Place ID", 120),
-            ("pid", "PID", 80),
-            ("job", "Server (jobId)", 380),
+            ("label", "Label", 130),
+            ("account", "Account", 160),
+            ("place", "Place ID", 110),
+            ("pid", "PID", 70),
+            ("job", "Server (jobId)", 320),
         ):
             self.tree.heading(col, text=head)
             self.tree.column(col, width=w, anchor=tk.W)
@@ -58,6 +70,18 @@ class App(tk.Tk):
 
         self.status_var = tk.StringVar(value="Ready. Mutex held — extra clients can launch.")
         ttk.Label(self, textvariable=self.status_var, anchor=tk.W, padding=(10, 4)).pack(fill=tk.X, side=tk.BOTTOM)
+
+    def _refresh_accounts_dropdown(self):
+        labels = [_NO_ACCOUNT] + [a.label() for a in self.store]
+        self.account_combo["values"] = labels
+        if self.account_var.get() not in labels:
+            self.account_var.set(labels[0])
+
+    def _resolve_selected_account(self):
+        choice = self.account_var.get()
+        if not choice or choice == _NO_ACCOUNT:
+            return None
+        return next((a for a in self.store if a.label() == choice), None)
 
     def _selected_instance(self):
         sel = self.tree.selection()
@@ -74,7 +98,13 @@ class App(tk.Tk):
         for inst in self.manager.instances:
             self.tree.insert(
                 "", tk.END,
-                values=(inst.label, inst.place_id, inst.pid or "-", inst.job_id or "-"),
+                values=(
+                    inst.label,
+                    inst.account.label() if inst.account else _NO_ACCOUNT,
+                    inst.place_id,
+                    inst.pid or "-",
+                    inst.job_id or "-",
+                ),
             )
 
     def _set_status(self, msg):
@@ -83,8 +113,7 @@ class App(tk.Tk):
     def _run_async(self, fn, on_done=None):
         def worker():
             try:
-                result = fn()
-                err = None
+                result, err = fn(), None
             except Exception as e:
                 result, err = None, e
             self.after(0, lambda: self._finish(result, err, on_done))
@@ -103,10 +132,11 @@ class App(tk.Tk):
         if not place_id:
             messagebox.showwarning("Invalid", "Enter a numeric placeId or roblox.com /games/<id>/ URL.")
             return
-        label = self.label_var.get().strip() or f"Instance {len(self.manager.instances) + 1}"
+        account = self._resolve_selected_account()
+        label = self.label_var.get().strip() or (account.label() if account else f"Instance {len(self.manager.instances) + 1}")
         self._set_status(f"Launching {label}…")
         self._run_async(
-            lambda: self.manager.add_instance(label, place_id),
+            lambda: self.manager.add_instance(label, place_id, account=account),
             on_done=lambda inst: self._set_status(
                 f"{inst.label} launched (pid={inst.pid})" if inst.pid else f"{inst.label}: launcher started, pid not detected"
             ),
@@ -144,6 +174,9 @@ class App(tk.Tk):
         self._refresh_tree()
         self._set_status(f"Closed {inst.label}")
 
+    def _open_account_manager(self):
+        AccountManager(self, self.store, on_change=self._refresh_accounts_dropdown)
+
     def _on_close(self):
         if self.manager.instances and not messagebox.askyesno(
             "Quit", "Closing will terminate all managed Roblox instances. Continue?"
@@ -151,6 +184,83 @@ class App(tk.Tk):
             return
         self.manager.shutdown()
         self.destroy()
+
+
+class AccountManager(tk.Toplevel):
+    """Add/remove accounts. Cookies are validated then DPAPI-encrypted at rest."""
+
+    def __init__(self, parent, store: AccountStore, on_change=None):
+        super().__init__(parent)
+        self.title("Accounts")
+        self.geometry("560x420")
+        self.transient(parent)
+        self.store = store
+        self.on_change = on_change
+
+        cols = ("nickname", "username", "user_id")
+        self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="browse")
+        for col, head, w in (("nickname", "Nickname", 160), ("username", "Username", 200), ("user_id", "User ID", 120)):
+            self.tree.heading(col, text=head)
+            self.tree.column(col, width=w, anchor=tk.W)
+        self.tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        form = ttk.Frame(self, padding=(10, 0))
+        form.pack(fill=tk.X)
+        ttk.Label(form, text="Nickname (optional):").grid(row=0, column=0, sticky=tk.W)
+        self.nickname_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self.nickname_var, width=24).grid(row=0, column=1, sticky=tk.W, padx=6)
+        ttk.Label(form, text=".ROBLOSECURITY cookie:").grid(row=1, column=0, sticky=tk.NW, pady=(6, 0))
+        self.cookie_text = tk.Text(form, height=4, width=60, wrap=tk.WORD)
+        self.cookie_text.grid(row=1, column=1, sticky=tk.W, padx=6, pady=(6, 0))
+
+        btns = ttk.Frame(self, padding=10)
+        btns.pack(fill=tk.X)
+        ttk.Button(btns, text="Add / Update", command=self._on_add).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Remove Selected", command=self._on_remove).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Close", command=self.destroy).pack(side=tk.RIGHT, padx=4)
+
+        self.status_var = tk.StringVar(value="Paste the .ROBLOSECURITY cookie value (no _|WARNING wrapper needed; both forms are accepted).")
+        ttk.Label(self, textvariable=self.status_var, anchor=tk.W, padding=(10, 4), wraplength=540, justify=tk.LEFT).pack(fill=tk.X, side=tk.BOTTOM)
+
+        self._refresh()
+
+    def _refresh(self):
+        self.tree.delete(*self.tree.get_children())
+        for acc in self.store:
+            self.tree.insert("", tk.END, iid=str(acc.user_id),
+                             values=(acc.nickname, acc.username, acc.user_id))
+        if self.on_change:
+            self.on_change()
+
+    def _on_add(self):
+        cookie = self.cookie_text.get("1.0", tk.END).strip()
+        if not cookie:
+            messagebox.showwarning("Missing", "Paste your .ROBLOSECURITY cookie.")
+            return
+        nickname = self.nickname_var.get().strip()
+        self.status_var.set("Validating cookie with Roblox…")
+        self.update_idletasks()
+        try:
+            acc = self.store.add_or_update(cookie, nickname=nickname)
+        except Exception as e:
+            messagebox.showerror("Validation failed", str(e))
+            self.status_var.set(f"Error: {e}")
+            return
+        self.cookie_text.delete("1.0", tk.END)
+        self.nickname_var.set("")
+        self.status_var.set(f"Saved {acc.label()} (user {acc.user_id}).")
+        self._refresh()
+
+    def _on_remove(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        user_id = int(sel[0])
+        acc = self.store.find(user_id)
+        if acc and messagebox.askyesno("Remove", f"Remove {acc.label()}?"):
+            self.store.remove(user_id)
+            self.status_var.set(f"Removed {acc.label()}.")
+            self._refresh()
 
 
 def main():
