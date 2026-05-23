@@ -3,10 +3,11 @@ import logging
 import os
 import subprocess
 import threading
+import time
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import font as tkfont, messagebox, ttk
 
-from . import browser_login, launcher, logging_setup, servers, theme
+from . import browser_login, dpi, launcher, logging_setup, servers, theme
 from .accounts import AccountStore
 from .config import ConfigStore, Preset
 from .manager import InstanceManager
@@ -14,8 +15,20 @@ from .manager import InstanceManager
 log = logging.getLogger(__name__)
 
 _NO_ACCOUNT = "(launcher's signed-in account)"
-_STATS_REFRESH_MS = 1500
+# Stats poll cadence. Updates land in-place so this is cheap, but bumped from
+# 1500 to 2000ms anyway to free the event loop for resize / scroll work.
+_STATS_REFRESH_MS = 2000
 _AFK_COL_INDEX = "#6"  # 1-based Treeview column id for the Anti-AFK cell
+
+# Skip a stats refresh if a <Configure> event landed within this window — the
+# user is actively resizing and we don't want to compete with Tk's reflow.
+_RESIZE_QUIET_SEC = 0.20
+
+
+def _row_iid(inst) -> str:
+    """Stable Treeview iid for an instance. Lets us update cells in place
+    instead of clear-and-rebuild, which kills resize-time jank."""
+    return f"i{id(inst)}"
 
 # Unicode glyphs used as status/AFK indicators.
 _STATUS_GLYPH = {
@@ -66,10 +79,28 @@ class _Tooltip:
         tw.wm_geometry(f"+{x}+{y}")
         try:
             tw.attributes("-topmost", True)
+            tw.attributes("-alpha", 0.0)
         except Exception:
             pass
         ttk.Label(tw, text=self.text, padding=(8, 4), style="Tooltip.TLabel").pack()
         self._tip = tw
+        # ~120ms fade in. Cheap; just attribute writes on a tiny toplevel.
+        self._fade(0.0)
+
+    def _fade(self, alpha: float):
+        if self._tip is None:
+            return
+        if alpha >= 0.95:
+            try:
+                self._tip.attributes("-alpha", 0.95)
+            except Exception:
+                pass
+            return
+        try:
+            self._tip.attributes("-alpha", alpha)
+        except Exception:
+            return
+        self._tip.after(16, lambda: self._fade(alpha + 0.16))
 
     def _hide(self, _=None):
         self._cancel()
@@ -82,14 +113,36 @@ class _Tooltip:
 
 
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, scale: float = 1.0):
         super().__init__()
+        self.scale_factor = scale
+        # Apply Tk's pixel-per-point scaling so widgets / fonts respect the
+        # monitor DPI. Has to happen before we set the window geometry so
+        # the initial size is correct.
+        dpi.apply_tk_scaling(self, scale)
+        self._setup_fonts()
+
         self.title("Multi Roblox Manager")
-        self.geometry("1080x700")
-        self.minsize(940, 560)
+        # Base layout designed at 1080x700; scale up for high-DPI monitors.
+        w = int(1080 * scale)
+        h = int(700 * scale)
+        self.geometry(f"{w}x{h}")
+        self.minsize(int(940 * scale), int(560 * scale))
+
+        # Hide the window until first paint to avoid a flash of un-themed
+        # widgets while we wire everything up.
+        try:
+            self.attributes("-alpha", 0.0)
+        except Exception:
+            pass
 
         self.log_path = logging_setup.setup()
         log.info("Multi Roblox Manager starting; log file at %s", self.log_path)
+
+        # Resize debounce: latest <Configure> timestamp on the root window.
+        # The stats refresher checks this and skips work while a drag is
+        # in flight so it doesn't compete with Tk's reflow.
+        self._last_configure = 0.0
 
         self.store = AccountStore()
         self.config = ConfigStore()
@@ -112,6 +165,44 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind_all("<Control-Tab>", lambda _e: self._cycle())
         self.bind_all("<Control-l>", lambda _e: self._focus_place_entry())
+        # Listen for root-level resize events so we can pause polling
+        # while the user is dragging the window edge.
+        self.bind("<Configure>", self._on_configure, add=True)
+        # Subtle fade in on first paint.
+        self.after(20, self._fade_in)
+
+    def _setup_fonts(self):
+        """Make the named Tk fonts use Segoe UI at appropriately scaled sizes."""
+        try:
+            base_size = max(9, int(round(9 * self.scale_factor)))
+            for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+                try:
+                    tkfont.nametofont(name).configure(family="Segoe UI", size=base_size)
+                except tk.TclError:
+                    continue
+            try:
+                tkfont.nametofont("TkFixedFont").configure(size=base_size)
+            except tk.TclError:
+                pass
+        except Exception:
+            log.exception("font setup failed")
+
+    def _fade_in(self):
+        """Fade the main window in over ~150ms after the first paint."""
+        def step(alpha: float):
+            try:
+                if alpha >= 1.0:
+                    self.attributes("-alpha", 1.0)
+                    return
+                self.attributes("-alpha", alpha)
+            except Exception:
+                return
+            self.after(16, lambda: step(alpha + 0.12))
+        step(0.0)
+
+    def _on_configure(self, event):
+        if event.widget is self:
+            self._last_configure = time.monotonic()
 
     # ---- layout ----------------------------------------------------------
 
@@ -380,12 +471,11 @@ class App(tk.Tk):
 
     def _selected_instances(self):
         out = []
+        by_iid = {_row_iid(inst): inst for inst in self.manager.instances}
         for iid in self.tree.selection():
-            idx = self.tree.index(iid)
-            try:
-                out.append(self.manager.instances[idx])
-            except IndexError:
-                continue
+            inst = by_iid.get(iid)
+            if inst is not None:
+                out.append(inst)
         return out
 
     def _selected_instance(self):
@@ -393,41 +483,48 @@ class App(tk.Tk):
         return sel[0] if sel else None
 
     def _refresh_tree(self):
-        self.tree.delete(*self.tree.get_children())
+        # Update existing rows in place and only delete rows for instances
+        # that no longer exist. Rebuilding the whole Treeview every poll is
+        # what made resizing feel laggy.
+        wanted_iids: set[str] = set()
         for inst in self.manager.instances:
+            iid = _row_iid(inst)
+            wanted_iids.add(iid)
             s = inst.last_sample
-            cpu = f"{s.cpu_percent:.0f}" if s.alive else "—"
-            ram = f"{s.rss_mb:.0f}" if s.alive else "—"
-            tags = ("crashed",) if inst.status == "crashed" else ()
-            status_text = _STATUS_GLYPH.get(inst.status, inst.status)
-            self.tree.insert(
-                "", tk.END,
-                values=(
-                    inst.label,
-                    inst.account.label() if inst.account else _NO_ACCOUNT,
-                    inst.place_id,
-                    inst.pid or "—",
-                    status_text,
-                    _AFK_ON if inst.antiafk_on else _AFK_OFF,
-                    cpu,
-                    ram,
-                    inst.job_id or "—",
-                ),
-                tags=tags,
+            values = (
+                inst.label,
+                inst.account.label() if inst.account else _NO_ACCOUNT,
+                inst.place_id,
+                inst.pid or "—",
+                _STATUS_GLYPH.get(inst.status, inst.status),
+                _AFK_ON if inst.antiafk_on else _AFK_OFF,
+                f"{s.cpu_percent:.0f}" if s.alive else "—",
+                f"{s.rss_mb:.0f}" if s.alive else "—",
+                inst.job_id or "—",
             )
+            tags = ("crashed",) if inst.status == "crashed" else ()
+            if self.tree.exists(iid):
+                self.tree.item(iid, values=values, tags=tags)
+            else:
+                self.tree.insert("", tk.END, iid=iid, values=values, tags=tags)
 
-        # Toggle the empty-state hint over the tree.
+        for child in self.tree.get_children():
+            if child not in wanted_iids:
+                self.tree.delete(child)
+
         if not self.manager.instances:
             self.empty_state.place(relx=0.5, rely=0.5, anchor="center")
         else:
             self.empty_state.place_forget()
 
     def _schedule_stats_refresh(self):
-        try:
-            self.manager.refresh_stats()
-            self._refresh_tree()
-        except Exception:
-            log.exception("stats refresh failed")
+        # Don't fight Tk's reflow while a resize is happening.
+        if time.monotonic() - self._last_configure > _RESIZE_QUIET_SEC:
+            try:
+                self.manager.refresh_stats()
+                self._refresh_tree()
+            except Exception:
+                log.exception("stats refresh failed")
         self.after(_STATS_REFRESH_MS, self._schedule_stats_refresh)
 
     def _apply_theme(self, requested: str, persist: bool = True) -> None:
@@ -582,10 +679,11 @@ class App(tk.Tk):
         row_id = self.tree.identify_row(event.y)
         if not row_id:
             return
-        idx = self.tree.index(row_id)
-        try:
-            inst = self.manager.instances[idx]
-        except IndexError:
+        inst = next(
+            (i for i in self.manager.instances if _row_iid(i) == row_id),
+            None,
+        )
+        if inst is None:
             return
         self._toggle_antiafk_for(inst)
         return "break"
@@ -858,5 +956,10 @@ class AccountManager(tk.Toplevel):
         self._refresh()
 
 
+def run(scale: float = 1.0):
+    App(scale=scale).mainloop()
+
+
 def main():
-    App().mainloop()
+    # Kept for backwards compatibility (e.g. `python -m multi_roblox.gui`).
+    run()

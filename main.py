@@ -17,12 +17,16 @@ def main():
     if platform.system() != "Windows":
         print("This tool only runs on Windows; Roblox client is Windows-only.", file=sys.stderr)
         sys.exit(1)
-    from multi_roblox import logging_setup
+    from multi_roblox import dpi, logging_setup
+    # Per-Monitor-V2 awareness must be enabled before any Tk window is
+    # constructed; otherwise Windows bitmap-stretches the first window
+    # and resize feels laggy thereafter.
+    scale = dpi.enable()
     log_path = logging_setup.setup()
     log = logging.getLogger("main")
     try:
-        from multi_roblox.gui import main as run
-        run()
+        from multi_roblox.gui import run
+        run(scale=scale)
     except Exception:
         log.exception("fatal error; see %s for details", log_path)
         raise
