@@ -53,19 +53,18 @@ server hopping that doesn't trip the "you are joining too quickly" errors.
   the status bar and logged so you can correlate breakage with updates.
 - **Per-instance Anti-AFK**: each row has an *Anti-AFK* column you can
   click to toggle, plus **Enable Anti-AFK on All** / **Disable on All**
-  buttons. Activity (5–15 px mouse jitter around the client area center,
-  plus an occasional `F15` keystroke — a dead function key no game binds)
-  is `PostMessageW`-ed straight to the background Roblox HWND every
-  12–35 s with randomization. Three modes based on the window/user
-  state: **background** (Roblox not foregrounded) ticks normally so
-  Forza-on-top stays kick-safe; **foreground + you're actively
-  playing** (real input within 60 s) skips entirely — PvP / 1v1 safety
-  so synthetic input can't clash with your clicks; **foreground +
-  you're truly AFK** (no system input for 60 s, checked via
-  `GetLastInputInfo`) slow-ticks at most once every 15 min — well
-  under Roblox's 20-min kick, but the absolute minimum input footprint
-  while you're away. Each worker sleeps almost the entire interval,
-  so dozens of them idle at effectively zero CPU.
+  buttons. When a tick fires we `PostMessageW` a 5–15 px mouse jitter
+  around the client-area center plus an `F15` keystroke — a "dead"
+  function key no game binds — straight to the background Roblox HWND,
+  **at most once every 15 minutes** per instance. That's the minimum
+  signal Roblox needs to reset its 20-minute idle timer; no spam.
+  Skip rule: if the Roblox window is foregrounded *and* you've
+  produced real keyboard/mouse input in the last 60 s (checked via
+  `GetLastInputInfo`), the tick is suppressed entirely — PvP / 1v1
+  safety so synthetic input can't clash with your real clicks. The
+  worker still wakes every 12–35 s to check state (Win32 calls that
+  cost microseconds) but only fires PostMessages on the 15-min
+  cadence, so dozens of workers idle at effectively zero CPU.
 - **Focus + cycle**: per-instance focus button, plus `Ctrl+Tab` to cycle.
   Uses `AttachThreadInput` + `SetForegroundWindow` to defeat focus-stealing
   prevention.
