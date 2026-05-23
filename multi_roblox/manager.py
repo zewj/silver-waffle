@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from . import auth, launcher, profiles, servers, stats, windows
+from . import antiafk, auth, launcher, profiles, servers, stats, windows
 from .accounts import Account
 from .mutex import SingletonMutex
 
@@ -23,6 +23,11 @@ class Instance:
     recent_jobs: list = field(default_factory=list)
     status: str = "starting"     # starting | running | crashed | closed
     last_sample: stats.Sample = field(default_factory=lambda: stats.Sample(alive=False))
+    antiafk_worker: Optional["antiafk.AntiAFK"] = None
+
+    @property
+    def antiafk_on(self) -> bool:
+        return self.antiafk_worker is not None and self.antiafk_worker.running
 
     def remember_job(self, job_id: str, cap: int = 10):
         if not job_id:
@@ -64,6 +69,8 @@ class InstanceManager:
     def shutdown(self):
         with self._lock:
             for inst in self.instances:
+                if inst.antiafk_worker:
+                    inst.antiafk_worker.stop()
                 if inst.pid:
                     windows.kill_pid(inst.pid)
                     stats.forget(inst.pid)
@@ -160,6 +167,9 @@ class InstanceManager:
         return windows.focus_window(inst.hwnd) if inst.hwnd else False
 
     def close(self, inst: Instance):
+        if inst.antiafk_worker:
+            inst.antiafk_worker.stop()
+            inst.antiafk_worker = None
         if inst.pid:
             windows.kill_pid(inst.pid)
             stats.forget(inst.pid)
@@ -167,6 +177,31 @@ class InstanceManager:
             if inst in self.instances:
                 self.instances.remove(inst)
         log.info("closed instance %s (pid=%s)", inst.label, inst.pid)
+
+    def set_antiafk(self, inst: Instance, enabled: bool) -> bool:
+        """Toggle a single instance's anti-AFK worker. Returns the new state."""
+        if enabled:
+            if inst.antiafk_worker is None:
+                inst.antiafk_worker = antiafk.AntiAFK(
+                    label=inst.label,
+                    hwnd_lookup=lambda i=inst: i.hwnd,
+                )
+            inst.antiafk_worker.start()
+        else:
+            if inst.antiafk_worker:
+                inst.antiafk_worker.stop()
+        return inst.antiafk_on
+
+    def set_antiafk_all(self, enabled: bool) -> int:
+        """Toggle anti-AFK for every running instance. Returns the count affected."""
+        affected = 0
+        for inst in self.instances:
+            if inst.status == "crashed":
+                continue
+            self.set_antiafk(inst, enabled)
+            affected += 1
+        log.info("anti-AFK %s for %d instance(s)", "enabled" if enabled else "disabled", affected)
+        return affected
 
     def server_hop(self, inst: Instance) -> Optional[str]:
         srv = servers.pick_server(inst.place_id, exclude_job_ids=inst.recent_jobs)

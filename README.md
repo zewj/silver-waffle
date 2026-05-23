@@ -51,6 +51,14 @@ server hopping that doesn't trip the "you are joining too quickly" errors.
   there's an **Open Logs** button so you can grab it for bug reports.
 - **Roblox version awareness**: the detected client version is shown in
   the status bar and logged so you can correlate breakage with updates.
+- **Per-instance Anti-AFK**: each row has an *Anti-AFK* column you can
+  click to toggle, plus **Enable Anti-AFK on All** / **Disable on All**
+  buttons. Activity (5–15 px mouse jitter around the client area center
+  plus an occasional benign `0` keystroke) is `PostMessageW`-ed straight
+  to the background Roblox HWND every 12–35 s with randomization, so
+  your foreground app keeps focus and overnight runs stay quiet — each
+  worker sleeps almost the entire interval, so dozens of workers idle at
+  effectively zero CPU.
 - **Focus + cycle**: per-instance focus button, plus `Ctrl+Tab` to cycle.
   Uses `AttachThreadInput` + `SetForegroundWindow` to defeat focus-stealing
   prevention.
@@ -156,6 +164,7 @@ Launches across the whole app are spaced by `launch_cooldown` (default
 main.py
 multi_roblox/
   accounts.py        # AccountStore (DPAPI-encrypted cookies, proxy per account)
+  antiafk.py         # Per-instance Anti-AFK ticker (PostMessageW, no focus steal)
   auth.py            # CSRF + authentication-ticket exchange (proxy-aware)
   browser_login.py   # Embedded webview sign-in (password / QR / passkey)
   config.py          # Persistent presets / recent places / cooldown / mode

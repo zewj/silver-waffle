@@ -90,22 +90,25 @@ class App(tk.Tk):
 
         live_frame = ttk.LabelFrame(body, text="Running instances (Ctrl/Shift-click for bulk)", padding=6)
         body.add(live_frame, weight=3)
-        cols = ("label", "account", "place", "pid", "status", "cpu", "ram", "job")
+        cols = ("label", "account", "place", "pid", "status", "afk", "cpu", "ram", "job")
         self.tree = ttk.Treeview(live_frame, columns=cols, show="headings", selectmode="extended")
-        for col, head, w in (
-            ("label", "Label", 120),
-            ("account", "Account", 140),
-            ("place", "Place ID", 90),
-            ("pid", "PID", 60),
-            ("status", "Status", 80),
-            ("cpu", "CPU %", 60),
-            ("ram", "RAM MB", 70),
-            ("job", "Server (jobId)", 240),
+        for col, head, w, anchor in (
+            ("label", "Label", 110, tk.W),
+            ("account", "Account", 130, tk.W),
+            ("place", "Place ID", 90, tk.W),
+            ("pid", "PID", 60, tk.W),
+            ("status", "Status", 70, tk.W),
+            ("afk", "Anti-AFK", 75, tk.CENTER),
+            ("cpu", "CPU %", 60, tk.W),
+            ("ram", "RAM MB", 70, tk.W),
+            ("job", "Server (jobId)", 220, tk.W),
         ):
             self.tree.heading(col, text=head)
-            self.tree.column(col, width=w, anchor=tk.W)
+            self.tree.column(col, width=w, anchor=anchor)
         self.tree.pack(fill=tk.BOTH, expand=True)
         self.tree.tag_configure("crashed", foreground="#aa0000")
+        # Click the AFK column to toggle that row.
+        self.tree.bind("<Button-1>", self._on_tree_click)
 
         preset_frame = ttk.LabelFrame(body, text="Saved presets (persist across restarts)", padding=6)
         body.add(preset_frame, weight=2)
@@ -123,6 +126,9 @@ class App(tk.Tk):
         ttk.Button(actions, text="Focus", command=self._on_focus).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Cycle (Ctrl+Tab)", command=self._cycle).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Server Hop", command=self._on_hop).pack(side=tk.LEFT, padx=4)
+        ttk.Button(actions, text="Toggle Anti-AFK", command=self._on_toggle_antiafk).pack(side=tk.LEFT, padx=4)
+        ttk.Button(actions, text="Enable Anti-AFK on All", command=lambda: self._on_set_antiafk_all(True)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(actions, text="Disable on All", command=lambda: self._on_set_antiafk_all(False)).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Close", command=self._on_close_instance).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Open Logs", command=self._open_logs).pack(side=tk.RIGHT, padx=4)
 
@@ -184,6 +190,7 @@ class App(tk.Tk):
                     inst.place_id,
                     inst.pid or "-",
                     inst.status,
+                    "[x] on" if inst.antiafk_on else "[ ] off",
                     cpu,
                     ram,
                     inst.job_id or "-",
@@ -288,6 +295,45 @@ class App(tk.Tk):
             self.manager.close(inst)
         self._refresh_tree()
         self._set_status(f"Closed {len(targets)} instance(s).")
+
+    def _toggle_antiafk_for(self, inst):
+        new_state = self.manager.set_antiafk(inst, not inst.antiafk_on)
+        self._set_status(f"Anti-AFK {'on' if new_state else 'off'} for {inst.label}.")
+        self._refresh_tree()
+
+    def _on_toggle_antiafk(self):
+        targets = self._selected_instances()
+        if not targets:
+            return
+        for inst in targets:
+            self._toggle_antiafk_for(inst)
+
+    def _on_set_antiafk_all(self, enabled):
+        count = self.manager.set_antiafk_all(enabled)
+        self._set_status(
+            f"Anti-AFK {'enabled' if enabled else 'disabled'} on {count} instance(s)."
+        )
+        self._refresh_tree()
+
+    def _on_tree_click(self, event):
+        # Make clicking inside the AFK column toggle that single row, without
+        # disturbing the multi-row selection used for bulk hop/close actions.
+        region = self.tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        col = self.tree.identify_column(event.x)
+        if col != "#6":  # AFK is the 6th column
+            return
+        row_id = self.tree.identify_row(event.y)
+        if not row_id:
+            return
+        idx = self.tree.index(row_id)
+        try:
+            inst = self.manager.instances[idx]
+        except IndexError:
+            return
+        self._toggle_antiafk_for(inst)
+        return "break"
 
     # ---- preset actions --------------------------------------------------
 

@@ -28,6 +28,12 @@ _user32.BringWindowToTop.restype = wintypes.BOOL
 _user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
 _user32.AttachThreadInput.restype = wintypes.BOOL
 _user32.GetForegroundWindow.restype = wintypes.HWND
+_user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+_user32.PostMessageW.restype = wintypes.BOOL
+_user32.IsWindow.argtypes = [wintypes.HWND]
+_user32.IsWindow.restype = wintypes.BOOL
+_user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+_user32.GetClientRect.restype = wintypes.BOOL
 _kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 
 SW_RESTORE = 9
