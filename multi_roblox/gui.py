@@ -3,7 +3,7 @@ import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from . import servers
+from . import browser_login, servers
 from .accounts import AccountStore
 from .config import ConfigStore, Preset
 from .manager import InstanceManager
@@ -327,10 +327,11 @@ class AccountManager(tk.Toplevel):
         btns = ttk.Frame(self, padding=10)
         btns.pack(fill=tk.X)
         ttk.Button(btns, text="Add / Update", command=self._on_add).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Sign in with Browser…", command=self._on_browser_login).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Remove Selected", command=self._on_remove).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Close", command=self.destroy).pack(side=tk.RIGHT, padx=4)
 
-        self.status_var = tk.StringVar(value="Paste the .ROBLOSECURITY cookie value (with or without the _|WARNING|_ wrapper).")
+        self.status_var = tk.StringVar(value="Paste the .ROBLOSECURITY cookie, or click 'Sign in with Browser…' to use password / QR / passkey via Roblox's own login page.")
         ttk.Label(self, textvariable=self.status_var, anchor=tk.W, padding=(10, 4), wraplength=560, justify=tk.LEFT).pack(fill=tk.X, side=tk.BOTTOM)
 
         self._refresh()
@@ -372,6 +373,34 @@ class AccountManager(tk.Toplevel):
             self.store.remove(user_id)
             self.status_var.set(f"Removed {acc.label()}.")
             self._refresh()
+
+    def _on_browser_login(self):
+        if not browser_login.is_available():
+            messagebox.showinfo("pywebview required", browser_login.install_hint())
+            return
+        nickname = self.nickname_var.get().strip()
+        self.status_var.set("Opening Roblox sign-in window… complete sign-in (password, QR, or passkey).")
+        self.update_idletasks()
+
+        def worker():
+            cookie = browser_login.harvest_via_subprocess()
+            self.after(0, lambda: self._finish_browser_login(cookie, nickname))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_browser_login(self, cookie, nickname):
+        if not cookie:
+            self.status_var.set("Sign-in cancelled or failed before a cookie was captured.")
+            return
+        try:
+            acc = self.store.add_or_update(cookie, nickname=nickname)
+        except Exception as e:
+            messagebox.showerror("Validation failed", str(e))
+            self.status_var.set(f"Error: {e}")
+            return
+        self.nickname_var.set("")
+        self.status_var.set(f"Signed in as {acc.label()} (user {acc.user_id}).")
+        self._refresh()
 
 
 def main():

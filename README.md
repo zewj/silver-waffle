@@ -53,16 +53,35 @@ python main.py
 
 ## Adding accounts
 
+Two ways:
+
+### Sign in with Browser (recommended — supports password, MFA, QR, passkey)
+
+1. Click **Accounts…** → **Sign in with Browser…**
+2. An embedded Roblox login window opens. Use *any* of Roblox's official
+   sign-in methods:
+   - Username + password (+ MFA if enabled)
+   - **QR code** ("Sign in with another device" on Roblox's login page —
+     scan with the Roblox mobile app on a signed-in phone)
+   - Passkey
+3. Once Roblox redirects you to the home page, the window closes and the
+   harvested `.ROBLOSECURITY` cookie is DPAPI-encrypted and saved.
+
+This needs `pywebview` (in `requirements.txt`); WebView2 runtime is
+preinstalled on Windows 10/11.
+
+### Paste cookie (no extra deps)
+
 1. Click **Accounts…**.
 2. In a logged-in browser, open DevTools → Application → Cookies →
    `https://www.roblox.com`, copy the `.ROBLOSECURITY` value.
 3. Paste it into the cookie box, give it a nickname, click **Add / Update**.
-   The cookie is validated against `users.roblox.com/v1/users/authenticated`
-   before being DPAPI-encrypted and saved to
-   `%APPDATA%\MultiRobloxManager\accounts.json`.
 
-Repeat per account. Cookies expire eventually — when they do, the launcher
-surfaces an `Auth ticket refused` error and you just paste a fresh cookie.
+Either way the cookie is validated against
+`users.roblox.com/v1/users/authenticated` before being saved to
+`%APPDATA%\MultiRobloxManager\accounts.json`. Cookies expire eventually —
+when they do, the launcher surfaces an `Auth ticket refused` error and
+you just re-run **Sign in with Browser…** (or paste a fresh cookie).
 
 > Keep cookies private. Anyone with your `.ROBLOSECURITY` value can log in
 > as you. The DPAPI wrapper means the on-disk blob can only be decrypted
@@ -110,16 +129,17 @@ Launches across the whole app are spaced by `launch_cooldown` (default
 ```
 main.py
 multi_roblox/
-  accounts.py    # AccountStore (DPAPI-encrypted cookies)
-  auth.py        # CSRF + authentication-ticket exchange
-  config.py      # Persistent presets / recent places / cooldown
-  dpapi.py       # CryptProtectData / CryptUnprotectData wrappers
-  gui.py         # Tkinter GUI
-  launcher.py    # Find RobloxPlayerBeta.exe; spawn with -t/-j
-  manager.py     # InstanceManager — mutex, launch, focus, hop
-  mutex.py       # SingletonMutex (ROBLOX_singletonEvent)
-  servers.py     # Public server list, jobId picker, protocol URI builder
-  windows.py     # Win32 helpers: PID list, window find/focus, kill
+  accounts.py        # AccountStore (DPAPI-encrypted cookies)
+  auth.py            # CSRF + authentication-ticket exchange
+  browser_login.py   # Embedded webview sign-in (password / QR / passkey)
+  config.py          # Persistent presets / recent places / cooldown
+  dpapi.py           # CryptProtectData / CryptUnprotectData wrappers
+  gui.py             # Tkinter GUI
+  launcher.py        # Find RobloxPlayerBeta.exe; spawn with -t/-j
+  manager.py         # InstanceManager — mutex, launch, focus, hop
+  mutex.py           # SingletonMutex (ROBLOX_singletonEvent)
+  servers.py         # Public server list, jobId picker, protocol URI builder
+  windows.py         # Win32 helpers: PID list, window find/focus, kill
 ```
 
 ## Data locations

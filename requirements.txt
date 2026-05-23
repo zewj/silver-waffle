@@ -1,1 +1,4 @@
 requests>=2.31.0
+# Optional: enables the "Sign in with Browser" / QR flow. WebView2 runtime is
+# preinstalled on Windows 10/11, so this works out of the box once installed.
+pywebview>=5.0
