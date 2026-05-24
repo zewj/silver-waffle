@@ -124,16 +124,22 @@ root:
 ```
 
 This sets up a venv, installs `pyinstaller` plus the runtime deps,
-and produces `dist\MultiRobloxManager.exe` — a single-file `.exe` you
-can copy anywhere. No Python install required on the destination
-machine.
+and produces `dist\MultiRobloxManager\MultiRobloxManager.exe` (a
+folder distribution, see below). No Python install required on the
+destination machine.
 
-The build uses `--onefile --windowed` (no console window) and pulls
-in `pywebview` + `psutil` via `--collect-all` so the
-browser-sign-in flow and the per-instance stats both work in the
-bundled exe. First launch unpacks to a temp dir so startup is a
-second or two slower than running from source — subsequent launches
-are normal speed once Windows caches the unpack.
+The build uses `--onedir`, which means the `.exe` sits in a folder
+alongside its DLLs. Startup is ~1-2s because Windows loads the DLLs
+straight from disk. The alternative (`--onefile`) bundles everything
+into a single `.exe` but has to extract ~100 MB to `%TEMP%` on every
+launch, which takes 7-13s — fine for one-off tools, painful for
+something you'll open every day. To distribute, zip the
+`dist\MultiRobloxManager\` folder; recipients extract it anywhere and
+run the `.exe` inside.
+
+`--collect-all` flags pull in `PySide6`, `pywebview`, `psutil`, `PIL`
+and `discord`; `--hidden-import` covers `socks` /
+`urllib3.contrib.socks` so SOCKS5 proxies work in the bundled exe.
 
 ## Adding accounts
 
