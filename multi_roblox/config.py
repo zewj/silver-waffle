@@ -35,6 +35,13 @@ class Config:
     webhook_url: str = ""
     # Master switch; even with a URL set, leaving this off mutes notifications.
     webhook_on_crash: bool = True
+    # Discord bot for remote control (!screenshot, !instances, etc).
+    bot_token: str = ""
+    bot_enabled: bool = False
+    # Discord user IDs allowed to invoke bot commands. Stored as strings
+    # because Discord snowflake IDs are 18-19 digits and JSON's number
+    # type is float64 — safe as strings, lossy as numbers.
+    bot_user_ids: list[str] = field(default_factory=list)
 
     def _key(self, p: Preset):
         return (p.label, p.place_id, p.account_user_id)
@@ -83,6 +90,9 @@ class ConfigStore:
             theme=theme,
             webhook_url=str(data.get("webhook_url", "")),
             webhook_on_crash=bool(data.get("webhook_on_crash", True)),
+            bot_token=str(data.get("bot_token", "")),
+            bot_enabled=bool(data.get("bot_enabled", False)),
+            bot_user_ids=[str(x) for x in data.get("bot_user_ids", [])],
         )
 
     def save(self):
@@ -96,6 +106,9 @@ class ConfigStore:
                 "theme": self.cfg.theme,
                 "webhook_url": self.cfg.webhook_url,
                 "webhook_on_crash": self.cfg.webhook_on_crash,
+                "bot_token": self.cfg.bot_token,
+                "bot_enabled": self.cfg.bot_enabled,
+                "bot_user_ids": self.cfg.bot_user_ids,
             }, indent=2), encoding="utf-8")
             tmp.replace(self.path)
 

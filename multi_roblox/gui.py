@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from . import browser_login, launcher, logging_setup, servers, webhook
+from . import browser_login, discord_bot, launcher, logging_setup, screenshot, servers, webhook
 from .accounts import AccountStore
 from .config import ConfigStore, Preset
 from .manager import InstanceManager
@@ -207,6 +207,11 @@ class MainWindow(QMainWindow):
         self._stats_timer.timeout.connect(self._on_stats_tick)
         self._stats_timer.start()
 
+        # Discord bot, started on first launch if enabled in config.
+        self.bot: Optional[discord_bot.ManagerBot] = None
+        if self.config.cfg.bot_enabled and self.config.cfg.bot_token:
+            QTimer.singleShot(200, self._auto_start_bot)
+
         # Subtle fade-in on first paint so the unstyled flash before QSS
         # applies doesn't show through.
         self.setWindowOpacity(0.0)
@@ -242,6 +247,9 @@ class MainWindow(QMainWindow):
         act_webhook = QAction("Notifications…", self)
         act_webhook.triggered.connect(self._open_webhook_settings)
         settings_menu.addAction(act_webhook)
+        act_bot = QAction("Discord Bot…", self)
+        act_bot.triggered.connect(self._open_bot_settings)
+        settings_menu.addAction(act_bot)
 
         help_menu = bar.addMenu("&Help")
         act_about = QAction("About", self)
@@ -914,6 +922,52 @@ class MainWindow(QMainWindow):
         dlg = WebhookSettingsDialog(self, self.config)
         dlg.exec()
 
+    def _open_bot_settings(self):
+        dlg = BotSettingsDialog(self, self.config)
+        dlg.exec()
+
+    # ---- bot lifecycle --------------------------------------------------
+
+    def _auto_start_bot(self):
+        try:
+            self.start_bot()
+        except Exception as e:
+            log.exception("auto-start bot failed")
+            self._toast(f"Bot failed to start: {e}", kind="error", duration_ms=5000)
+
+    def start_bot(self) -> None:
+        """Start (or restart) the Discord bot using the persisted config."""
+        cfg = self.config.cfg
+        if self.bot is not None:
+            self.stop_bot()
+        if not discord_bot.is_available():
+            raise RuntimeError(discord_bot.install_hint())
+        if not cfg.bot_token:
+            raise RuntimeError("Bot token is empty.")
+        if not cfg.bot_user_ids:
+            raise RuntimeError(
+                "Authorized Discord user IDs are empty — refusing to start a "
+                "bot that anyone in the server could command. Add at least "
+                "your own Discord user ID."
+            )
+        self.bot = discord_bot.ManagerBot(
+            token=cfg.bot_token,
+            manager=self.manager,
+            allowed_user_ids=cfg.bot_user_ids,
+            screenshot_fn=screenshot.capture_window_png,
+        )
+        self.bot.start()
+        self._set_status("Discord bot started.")
+
+    def stop_bot(self) -> None:
+        if self.bot is None:
+            return
+        try:
+            self.bot.stop()
+        finally:
+            self.bot = None
+        self._set_status("Discord bot stopped.")
+
     def _on_accounts_changed(self):
         self._refresh_accounts_dropdown()
         self._refresh_presets()
@@ -945,6 +999,10 @@ class MainWindow(QMainWindow):
             if ans != QMessageBox.Yes:
                 event.ignore()
                 return
+        try:
+            self.stop_bot()
+        except Exception:
+            log.exception("bot shutdown failed")
         try:
             self.manager.shutdown()
         except Exception:
@@ -1265,6 +1323,167 @@ class WebhookSettingsDialog(QDialog):
         self.config.cfg.webhook_on_crash = self.enable_radio_on.isChecked()
         self.config.save()
         self.accept()
+
+
+# ---------------------------------------------------------------------------
+# Discord bot dialog
+
+
+class BotSettingsDialog(QDialog):
+    """Configure the Discord bot — token, authorized users, start/stop."""
+
+    def __init__(self, parent: MainWindow, config: ConfigStore):
+        super().__init__(parent)
+        self.setWindowTitle("Discord Bot")
+        self.resize(640, 460)
+        self.config = config
+        self._main = parent
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        title = QLabel("Discord bot — remote screenshots & control")
+        title.setObjectName("titleLabel")
+        layout.addWidget(title)
+
+        intro = QLabel(
+            "Create a bot at <a href='https://discord.com/developers/applications'>"
+            "discord.com/developers/applications</a>, invite it to your server, then "
+            "paste its <b>bot token</b> (Bot tab → Reset Token) below. Add your "
+            "own Discord user ID to the allowlist — without it the bot refuses "
+            "every command.<br><br>"
+            "Commands: <code>!instances</code>, "
+            "<code>!screenshot [all | &lt;label&gt; | &lt;index&gt;]</code>, "
+            "<code>!ping</code>."
+        )
+        intro.setObjectName("muted")
+        intro.setWordWrap(True)
+        intro.setOpenExternalLinks(True)
+        layout.addWidget(intro)
+
+        if not discord_bot.is_available():
+            warn = QLabel(discord_bot.install_hint())
+            warn.setObjectName("muted")
+            warn.setWordWrap(True)
+            layout.addWidget(warn)
+
+        cfg = config.cfg
+        box = QGroupBox("Bot configuration")
+        gl = QGridLayout(box)
+        gl.setContentsMargins(12, 18, 12, 12)
+        gl.setVerticalSpacing(8)
+        gl.setHorizontalSpacing(10)
+
+        gl.addWidget(QLabel("Bot token"), 0, 0)
+        self.token_edit = QLineEdit(cfg.bot_token)
+        self.token_edit.setEchoMode(QLineEdit.Password)
+        self.token_edit.setPlaceholderText("paste from Discord developer portal")
+        gl.addWidget(self.token_edit, 0, 1)
+        show_btn = QPushButton("Show")
+        show_btn.setCheckable(True)
+        show_btn.toggled.connect(
+            lambda on: self.token_edit.setEchoMode(
+                QLineEdit.Normal if on else QLineEdit.Password,
+            )
+        )
+        gl.addWidget(show_btn, 0, 2)
+
+        gl.addWidget(QLabel("Authorized user IDs"), 1, 0, Qt.AlignTop)
+        self.ids_edit = QTextEdit()
+        self.ids_edit.setPlaceholderText(
+            "One Discord user ID per line. Right-click your username in "
+            "Discord (with Developer Mode on) → Copy User ID."
+        )
+        self.ids_edit.setFixedHeight(110)
+        self.ids_edit.setPlainText("\n".join(cfg.bot_user_ids))
+        gl.addWidget(self.ids_edit, 1, 1, 1, 2)
+
+        self.enable_radio_on = QRadioButton("Bot enabled (start with app)")
+        self.enable_radio_off = QRadioButton("Disabled")
+        (self.enable_radio_on if cfg.bot_enabled
+         else self.enable_radio_off).setChecked(True)
+        radio_row = QHBoxLayout()
+        radio_row.addWidget(self.enable_radio_on)
+        radio_row.addWidget(self.enable_radio_off)
+        radio_row.addStretch(1)
+        wrap = QWidget()
+        wrap.setLayout(radio_row)
+        gl.addWidget(wrap, 2, 0, 1, 3)
+
+        gl.setColumnStretch(1, 1)
+        layout.addWidget(box)
+
+        self.status_label = QLabel(self._status_text())
+        self.status_label.setObjectName("muted")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        self.start_btn = QPushButton("Save & Start")
+        self.start_btn.setObjectName("primaryButton")
+        self.start_btn.clicked.connect(self._on_save_start)
+        btn_row.addWidget(self.start_btn)
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.clicked.connect(self._on_stop)
+        btn_row.addWidget(self.stop_btn)
+        btn_row.addStretch(1)
+        cancel_btn = QPushButton("Close")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        QTimer.singleShot(
+            0, lambda: _apply_dark_title_bar(self, parent.config.cfg.theme == "dark"),
+        )
+
+    def _status_text(self) -> str:
+        if self._main.bot is None:
+            return "Status: stopped."
+        return "Status: running."
+
+    def _parsed_ids(self) -> list[str]:
+        raw = self.ids_edit.toPlainText()
+        out = []
+        for chunk in raw.replace(",", "\n").splitlines():
+            s = chunk.strip()
+            if not s:
+                continue
+            if not s.isdigit():
+                raise ValueError(f"User ID {s!r} is not numeric.")
+            out.append(s)
+        return out
+
+    def _persist(self, enabled: bool):
+        cfg = self.config.cfg
+        cfg.bot_token = self.token_edit.text().strip()
+        cfg.bot_user_ids = self._parsed_ids()
+        cfg.bot_enabled = enabled
+        self.config.save()
+
+    def _on_save_start(self):
+        try:
+            self._persist(enabled=self.enable_radio_on.isChecked())
+        except ValueError as e:
+            self.status_label.setText(f"Error: {e}")
+            return
+        try:
+            self._main.start_bot()
+        except Exception as e:
+            self.status_label.setText(f"Error: {e}")
+            return
+        self.status_label.setText("Status: running. Try !ping in your server.")
+
+    def _on_stop(self):
+        try:
+            self._main.stop_bot()
+        finally:
+            # Keep auto-start preference but mark the running state stopped.
+            self.config.cfg.bot_enabled = False
+            self.config.save()
+            self.enable_radio_off.setChecked(True)
+            self.status_label.setText("Status: stopped.")
 
 
 # ---------------------------------------------------------------------------

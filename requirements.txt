@@ -10,3 +10,8 @@ PySide6>=6.6
 # Optional: enables the "Sign in with Browser" / QR flow. WebView2 runtime is
 # preinstalled on Windows 10/11, so this works out of the box once installed.
 pywebview>=5.0
+# PNG encoding for the Discord bot's window screenshots.
+Pillow>=10.0
+# Optional: Discord bot for remote screenshots and control. Disabled until
+# you paste a token in Settings → Discord Bot…
+discord.py>=2.3

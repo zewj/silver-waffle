@@ -60,6 +60,14 @@ server hopping that doesn't trip the "you are joining too quickly" errors.
   manager detects an instance's PID went away — label, account, place,
   jobId, timestamp. POST runs in a background thread so the GUI never
   blocks. Built-in **Send Test** verifies the URL before you commit.
+- **Discord bot for remote screenshots**: optional. *Settings → Discord
+  Bot…* runs a `discord.py` bot in a background asyncio loop. Commands:
+  `!instances` lists what's running, `!screenshot [all | <label> |
+  <index>]` captures Roblox windows via `PrintWindow` with
+  `PW_RENDERFULLCONTENT` (works on minimized / occluded windows) and
+  attaches PNGs to the reply, `!ping` is a health check. Requires an
+  allowlist of authorized Discord user IDs — without it the bot refuses
+  every command.
 - **Modern Qt UI**: built on PySide6. Dark / light theming via QSS,
   native DPI (no bitmap stretching on high-DPI monitors), window
   fade-in on startup, slide-and-fade toast notifications on
@@ -211,6 +219,7 @@ multi_roblox/
   auth.py            # CSRF + authentication-ticket exchange (proxy-aware)
   browser_login.py   # Embedded webview sign-in (password / QR / passkey)
   config.py          # Persistent presets / recent places / cooldown / mode
+  discord_bot.py     # Optional discord.py bot for remote screenshots + control
   dpapi.py           # CryptProtectData / CryptUnprotectData wrappers
   gui.py             # PySide6 GUI (MainWindow + AccountManagerDialog + Toast)
   launcher.py        # Find launcher + player exes; spawn with env overrides
@@ -218,6 +227,7 @@ multi_roblox/
   manager.py         # InstanceManager — mutex, launch, focus, hop, stats
   mutex.py           # SingletonMutex (ROBLOX_singletonEvent)
   profiles.py        # Per-account LOCALAPPDATA isolation (mklink /J)
+  screenshot.py      # Per-HWND capture via PrintWindow + GDI -> PNG bytes
   servers.py         # Public server list, jobId picker, protocol URI builder
   stats.py           # psutil-based CPU/RAM/liveness sampling
   styles.py          # Dark and light Qt Style Sheets (Fluent-ish)
