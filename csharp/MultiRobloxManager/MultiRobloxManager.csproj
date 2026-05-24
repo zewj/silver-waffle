@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <AssemblyName>MultiRobloxManager</AssemblyName>
+    <RootNamespace>MultiRobloxManager</RootNamespace>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>false</EnableCompressionInSingleFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- DPAPI (ProtectedData / DataProtectionScope) is shipped as an
+         out-of-band package even on net8.0-windows; without this the
+         Dpapi service won't compile. -->
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+    <!--
+      Heavy add-on libraries that the Python version uses (Discord.Net for
+      the bot, Microsoft.Web.WebView2 for the browser login flow, etc.) are
+      intentionally NOT referenced yet. The MVP doesn't ship those
+      features; future sessions add the references when the corresponding
+      services land.
+    -->
+  </ItemGroup>
+
+</Project>
