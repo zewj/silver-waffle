@@ -42,9 +42,12 @@ class Instance:
 class InstanceManager:
     """Owns the singleton mutex and the set of launched instances."""
 
-    # Roblox throttles join attempts. Spacing launches avoids the
-    # "joining too quickly" / "already running" errors.
-    LAUNCH_COOLDOWN = 2.5
+    # Roblox throttles join attempts AND auth-ticket mints. 6s spacing
+    # keeps us well clear of the auth.roblox.com per-cookie 429 ceiling
+    # (~10-20 reqs/min) while still feeling responsive. Tunable via the
+    # `launch_cooldown` field in %APPDATA%\MultiRobloxManager\config.json
+    # if you want it tighter (at the risk of more 429s).
+    LAUNCH_COOLDOWN = 6.0
     # How long to wait for a new RobloxPlayerBeta.exe to appear after a
     # launch. Protocol mode goes through RobloxPlayerLauncher.exe which may
     # run an update first, so we give it more headroom than direct exec.

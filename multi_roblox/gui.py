@@ -714,8 +714,14 @@ class MainWindow(QMainWindow):
 
     def _finish_async(self, result, err, on_done):
         if err:
-            self._set_status(f"Error: {err}", kind="error")
-            QMessageBox.critical(self, "Error", str(err))
+            # Rate limit is common enough that we shouldn't pop a modal —
+            # a toast is plenty since the user can just try again later.
+            from .auth import RateLimitError
+            if isinstance(err, RateLimitError):
+                self._set_status(str(err), kind="error")
+            else:
+                self._set_status(f"Error: {err}", kind="error")
+                QMessageBox.critical(self, "Error", str(err))
         elif on_done:
             on_done(result)
         self._refresh_tree()

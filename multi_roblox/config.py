@@ -25,7 +25,7 @@ class Preset:
 class Config:
     presets: list[Preset] = field(default_factory=list)
     recent_places: list[int] = field(default_factory=list)
-    launch_cooldown: float = 2.5
+    launch_cooldown: float = 6.0  # seconds; conservative to avoid auth.roblox.com 429
     # "protocol": go through RobloxPlayerLauncher.exe (stable, default).
     # "direct":   spawn RobloxPlayerBeta.exe directly (faster, skips launcher).
     launch_mode: str = "protocol"
@@ -85,7 +85,7 @@ class ConfigStore:
         return Config(
             presets=[Preset(**p) for p in data.get("presets", [])],
             recent_places=data.get("recent_places", []),
-            launch_cooldown=float(data.get("launch_cooldown", 2.5)),
+            launch_cooldown=float(data.get("launch_cooldown", 6.0)),
             launch_mode=mode,
             theme=theme,
             webhook_url=str(data.get("webhook_url", "")),

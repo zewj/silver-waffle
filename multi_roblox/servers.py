@@ -26,12 +26,20 @@ def fetch_servers(place_id: int, limit: int = 100, sort: str = "Asc",
     If `proxy` is given, the request is routed through it. We pass it via
     the per-call `proxies=` kwarg rather than mutating the module-level
     session, so different callers can use different proxies safely.
+
+    Raises auth.RateLimitError on HTTP 429 so the manager can surface
+    a "wait N seconds before hopping again" status instead of a generic
+    HTTPError.
     """
+    from . import auth  # local import: avoids cycle if servers ever moves
     url = f"https://games.roblox.com/v1/games/{place_id}/servers/Public"
     proxies = {"http": proxy, "https": proxy} if proxy else None
-    resp = _SESSION.get(
-        url, params={"sortOrder": sort, "limit": limit},
-        timeout=10, proxies=proxies,
+    resp = auth._do_with_retry(
+        "server list",
+        lambda: _SESSION.get(
+            url, params={"sortOrder": sort, "limit": limit},
+            timeout=10, proxies=proxies,
+        ),
     )
     resp.raise_for_status()
     return resp.json().get("data", [])

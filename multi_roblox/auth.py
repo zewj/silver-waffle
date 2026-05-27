@@ -1,5 +1,6 @@
 """Roblox web-auth flows: CSRF, authentication tickets, identity lookup."""
 import logging
+import random
 import time
 import urllib.parse
 from typing import Optional
@@ -23,9 +24,22 @@ _SUPPORTED_PROXY_SCHEMES = {
     "socks4", "socks4a",
 }
 
+# How aggressively we retry on 429. Capped low because Roblox's rate
+# windows are minutes-long — pounding on it makes the lockout worse.
+_RATE_RETRIES = 2
+_RATE_FALLBACK_WAIT_SEC = 12.0
+
 
 class AuthError(RuntimeError):
-    pass
+    """Generic auth failure (bad cookie, ticket refused, server error)."""
+
+
+class RateLimitError(AuthError):
+    """Roblox returned 429. Includes the suggested wait so the caller can
+    back off intelligently instead of treating it like a generic failure."""
+    def __init__(self, message: str, retry_after_sec: float):
+        super().__init__(message)
+        self.retry_after_sec = retry_after_sec
 
 
 def validate_proxy_url(url: Optional[str]) -> str:
@@ -67,9 +81,62 @@ def _session(cookie: str, proxy: Optional[str] = None) -> requests.Session:
     return s
 
 
+def _retry_after_seconds(resp: requests.Response) -> float:
+    """Parse the Retry-After header (integer seconds; HTTP-date variant is
+    rare from Roblox in practice). Falls back to a fixed wait so we always
+    return *something* the caller can sleep on."""
+    raw = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
+    if raw:
+        try:
+            return max(1.0, float(raw.strip()))
+        except ValueError:
+            pass
+    return _RATE_FALLBACK_WAIT_SEC
+
+
+def _raise_for_rate_limit(resp: requests.Response, what: str) -> None:
+    """Convert a 429 into a typed RateLimitError. No-op for other statuses."""
+    if resp.status_code != 429:
+        return
+    wait = _retry_after_seconds(resp)
+    log.warning("%s rate-limited (429); Retry-After=%.1fs", what, wait)
+    raise RateLimitError(
+        f"Roblox rate-limited the {what} request (HTTP 429). "
+        f"Try again in ~{int(wait)}s, or add a proxy / slow the launch cadence.",
+        retry_after_sec=wait,
+    )
+
+
+def _do_with_retry(label: str, call) -> requests.Response:
+    """Run `call()` (returns a Response) with limited 429 retries + jitter.
+
+    We retry at most _RATE_RETRIES times, sleeping for the server-suggested
+    Retry-After plus a small randomized jitter. The final 429 turns into a
+    RateLimitError so the caller can show it cleanly in the UI.
+    """
+    last: Optional[requests.Response] = None
+    for attempt in range(_RATE_RETRIES + 1):
+        resp = call()
+        last = resp
+        if resp.status_code != 429:
+            return resp
+        if attempt == _RATE_RETRIES:
+            break
+        wait = _retry_after_seconds(resp) + random.uniform(0.5, 2.0)
+        log.info("%s: 429 attempt %d/%d, sleeping %.1fs",
+                 label, attempt + 1, _RATE_RETRIES + 1, wait)
+        time.sleep(wait)
+    assert last is not None
+    _raise_for_rate_limit(last, label)
+    return last  # unreachable; _raise_for_rate_limit raised
+
+
 def fetch_csrf_token(session: requests.Session) -> str:
     """An empty POST to /v2/logout returns 403 with the X-CSRF-TOKEN header."""
-    resp = session.post("https://auth.roblox.com/v2/logout", timeout=10)
+    resp = _do_with_retry(
+        "CSRF probe",
+        lambda: session.post("https://auth.roblox.com/v2/logout", timeout=10),
+    )
     token = resp.headers.get("x-csrf-token")
     if not token:
         raise AuthError("Could not retrieve CSRF token (cookie may be invalid)")
@@ -79,7 +146,10 @@ def fetch_csrf_token(session: requests.Session) -> str:
 def whoami(cookie: str, proxy: Optional[str] = None) -> dict:
     """Validate a cookie and return {id, name, displayName}."""
     s = _session(cookie, proxy=proxy)
-    resp = s.get("https://users.roblox.com/v1/users/authenticated", timeout=10)
+    resp = _do_with_retry(
+        "cookie validation",
+        lambda: s.get("https://users.roblox.com/v1/users/authenticated", timeout=10),
+    )
     if resp.status_code == 401:
         raise AuthError("Cookie rejected (401). Re-export .ROBLOSECURITY from the browser.")
     resp.raise_for_status()
@@ -95,9 +165,12 @@ def fetch_auth_ticket(cookie: str, proxy: Optional[str] = None) -> str:
         "RBXAuthenticationNegotiation": "1",
         "Content-Type": "application/json",
     }
-    resp = s.post(
-        "https://auth.roblox.com/v1/authentication-ticket/",
-        headers=headers, json={}, timeout=10,
+    resp = _do_with_retry(
+        "auth ticket",
+        lambda: s.post(
+            "https://auth.roblox.com/v1/authentication-ticket/",
+            headers=headers, json={}, timeout=10,
+        ),
     )
     if resp.status_code in (401, 403):
         raise AuthError(f"Auth ticket refused ({resp.status_code}); cookie expired?")
