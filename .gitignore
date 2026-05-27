@@ -11,3 +11,11 @@ venv/
 build/
 dist/
 *.spec
+
+# .NET / Visual Studio build artifacts (from the C# branch when it
+# gets merged or browsed from this branch).
+bin/
+obj/
+*.user
+*.suo
+.vs/
