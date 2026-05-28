@@ -23,7 +23,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QAction, QColor, QFont, QFontDatabase, QPalette
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QDialog, QFormLayout,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFormLayout,
     QFrame, QGraphicsOpacityEffect, QGridLayout, QGroupBox, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMenuBar,
     QMessageBox, QPushButton, QRadioButton, QSizePolicy, QSpacerItem,
@@ -1026,36 +1026,74 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Logs", f"Could not open {self.log_path.parent}: {e}")
 
     def _on_wipe_data(self):
-        """Show a hard confirmation dialog, then nuke %APPDATA%\\MultiRobloxManager\\.
+        """Custom dialog with a "also reset Roblox sign-in" opt-in.
 
-        Walks the user through exactly what's about to be deleted so they
-        can't trigger this by accident. After confirmation we:
-          1. Stop the Discord bot if running.
-          2. Terminate every Roblox client we tracked.
-          3. Release the singleton mutex.
-          4. Delete %APPDATA%\\MultiRobloxManager\\ (handles junctions safely).
-          5. Quit — the app's persistent state is gone so continuing would
-             only re-write fresh files we just spent effort deleting.
+        QMessageBox doesn't support checkboxes, so we hand-build a QDialog
+        with the warning text + the checkbox + Yes/No buttons. On confirm:
+          1. Stop the Discord bot.
+          2. Terminate every Roblox client we tracked + release the mutex.
+          3. Delete %APPDATA%\\MultiRobloxManager\\ (junction-safe).
+          4. If the checkbox is on: also clear the Roblox client's local
+             sign-in state (LocalStorage + HKCU\\Software\\Roblox\\
+             RobloxStudioBrowser). This is what un-sticks the "browser
+             launches the wrong account" problem.
+          5. Quit.
         """
         root = wipe.app_root()
-        msg = (
-            f"This will permanently delete:\n\n"
-            f"  • {root}\n"
-            f"    accounts.json (encrypted cookies)\n"
-            f"    config.json (presets, webhook, bot token)\n"
-            f"    logs\\\n"
-            f"    data\\<user_id>\\ (per-account profile dirs)\n\n"
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Wipe all app data")
+        dlg.setMinimumWidth(560)
+        v = QVBoxLayout(dlg)
+        v.setContentsMargins(16, 14, 16, 14)
+        v.setSpacing(10)
+
+        warn = QLabel(
+            f"<b>This will permanently delete:</b><br>"
+            f"&nbsp;&nbsp;• {root}<br>"
+            f"&nbsp;&nbsp;&nbsp;&nbsp;accounts.json (encrypted cookies)<br>"
+            f"&nbsp;&nbsp;&nbsp;&nbsp;config.json (presets, webhook, bot token)<br>"
+            f"&nbsp;&nbsp;&nbsp;&nbsp;logs\\<br>"
+            f"&nbsp;&nbsp;&nbsp;&nbsp;data\\&lt;user_id&gt;\\ (per-account profile dirs)<br><br>"
             f"It will also terminate every managed Roblox instance and the "
-            f"Discord bot (if running), then close this app.\n\n"
-            f"It does NOT touch your real Roblox install, the real "
-            f"%LOCALAPPDATA%\\Roblox folder, or this app's exe.\n\n"
-            f"Continue?"
+            f"Discord bot (if running), then close this app."
         )
-        if QMessageBox.question(
-            self, "Wipe all app data", msg,
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-        ) != QMessageBox.Yes:
+        warn.setWordWrap(True)
+        v.addWidget(warn)
+
+        also_reset = QCheckBox(
+            "Also reset Roblox sign-in on this machine "
+            "(fixes 'browser launches the wrong account')"
+        )
+        also_reset.setChecked(False)
+        v.addWidget(also_reset)
+
+        sub = QLabel(
+            "With the checkbox on we also delete "
+            "<code>%LOCALAPPDATA%\\Roblox\\LocalStorage\\</code> and "
+            "<code>HKCU\\Software\\Roblox\\RobloxStudioBrowser</code> — the "
+            "auth state Roblox writes after a managed launch. <b>You'll need "
+            "to sign in to Roblox again via your browser afterwards.</b> "
+            "Your Roblox install, graphics settings, and keybinds are not "
+            "touched."
+        )
+        sub.setObjectName("muted")
+        sub.setWordWrap(True)
+        v.addWidget(sub)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dlg.reject)
+        btn_row.addWidget(cancel_btn)
+        confirm_btn = QPushButton("Wipe")
+        confirm_btn.setObjectName("primaryButton")
+        confirm_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(confirm_btn)
+        v.addLayout(btn_row)
+
+        if dlg.exec() != QDialog.Accepted:
             return
+        reset_login = also_reset.isChecked()
 
         # Stop the bot and shut down managed instances before deleting.
         try:
@@ -1068,22 +1106,35 @@ class MainWindow(QMainWindow):
             log.exception("manager shutdown during wipe failed")
 
         summary = wipe.wipe()
-        if summary["errors"]:
+        login_summary = wipe.reset_roblox_login_state() if reset_login else None
+
+        # Combine summaries for the user-facing report.
+        all_errors = list(summary["errors"])
+        all_removed = list(summary["removed"])
+        if login_summary is not None:
+            all_errors.extend(login_summary["errors"])
+            all_removed.extend(login_summary["removed"])
+
+        if all_errors:
             QMessageBox.warning(
                 self, "Wipe finished with errors",
-                "Some files could not be deleted (see log):\n\n"
-                + "\n".join(f"  • {p}: {why}" for p, why in summary["errors"][:10])
+                "Some items could not be removed (see log):\n\n"
+                + "\n".join(f"  • {p}" if isinstance(p, str) else f"  • {p[0]}"
+                            for p in all_errors[:10])
             )
         else:
-            QMessageBox.information(
-                self, "Wipe complete",
-                "All app data removed.\n"
-                f"({len(summary['removed'])} path(s), "
-                f"{summary['junctions_removed']} junction(s)).",
+            msg = (
+                f"App data removed ({len(summary['removed'])} path(s), "
+                f"{summary['junctions_removed']} junction(s))."
             )
+            if reset_login:
+                msg += (
+                    f"\nRoblox sign-in state also cleared "
+                    f"({len(login_summary['removed'])} item(s)). "
+                    "Sign in to Roblox via your browser before launching again."
+                )
+            QMessageBox.information(self, "Wipe complete", msg)
 
-        # Bypass the "Closing will terminate all managed Roblox instances"
-        # confirmation in closeEvent — the user already confirmed once.
         QApplication.quit()
 
     def _show_about(self):

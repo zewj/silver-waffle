@@ -1,9 +1,29 @@
 """Remove everything the app has put on disk.
 
-Wipes `%APPDATA%\\MultiRobloxManager\\` and its contents — accounts,
-config, logs, per-account profile directories. Anything outside that
-folder (the real Roblox install, the user's `%LOCALAPPDATA%\\Roblox`,
-the registry, the exe itself) is intentionally left alone.
+`wipe()` removes `%APPDATA%\\MultiRobloxManager\\` and its contents —
+accounts, config, logs, per-account profile dirs. Anything outside
+that folder (Roblox install, registry, exe) is left alone.
+
+`reset_roblox_login_state()` additionally clears the Roblox client's
+own persisted sign-in state on this machine:
+
+  * `%LOCALAPPDATA%\\Roblox\\LocalStorage\\` — cookies + session state
+  * `HKCU\\Software\\Roblox\\RobloxStudioBrowser` — auth/account hints
+    the launcher reads when the browser fires a `roblox-player:` URL
+
+This is the "browser launches the wrong account" fix: when our
+managed launches authenticate via tickets, the Roblox client writes
+who-is-currently-signed-in markers into both of those locations. Even
+after our app folder is gone, those markers stick and the browser's
+Play button keeps using them. Clearing them puts the system back in
+the "not signed in to Roblox yet on this device" state, so the
+browser launcher will use whoever you're signed in as in your browser
+again.
+
+This DOES NOT touch:
+  * `%LOCALAPPDATA%\\Roblox\\Versions\\` — the actual game install
+  * `GlobalBasicSettings_*.xml` — your graphics / keybinds
+  * Anything outside the keys / paths listed above
 
 Safety: each per-account profile contains a directory junction
 (`<acc>\\Roblox\\Versions` → real `%LOCALAPPDATA%\\Roblox\\Versions`).
@@ -123,4 +143,100 @@ def wipe() -> dict:
     log.info("wipe complete: removed=%d junctions=%d errors=%d",
              len(summary["removed"]), summary["junctions_removed"],
              len(summary["errors"]))
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Roblox-side login state reset
+
+
+def _roblox_localstorage_dir() -> Path:
+    """`%LOCALAPPDATA%\\Roblox\\LocalStorage\\`."""
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    return Path(base) / "Roblox" / "LocalStorage"
+
+
+def _delete_localstorage() -> tuple[bool, str]:
+    """Remove the LocalStorage folder. Returns (succeeded, note)."""
+    target = _roblox_localstorage_dir()
+    if not target.exists():
+        return True, f"{target} (already gone)"
+    try:
+        shutil.rmtree(target)
+        return True, str(target)
+    except Exception as e:
+        if os.name == "nt":
+            try:
+                subprocess.run(
+                    ["cmd", "/c", "rmdir", "/S", "/Q", str(target)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=_CREATE_NO_WINDOW, check=True,
+                )
+                return True, str(target)
+            except Exception as e2:
+                return False, f"{target}: {e} / fallback: {e2}"
+        return False, f"{target}: {e}"
+
+
+def _delete_registry_key(subkey: str) -> tuple[bool, str]:
+    """Recursively delete an HKCU subkey. Returns (succeeded, note)."""
+    if os.name != "nt":
+        return True, f"HKCU\\{subkey} (not Windows; skipped)"
+    try:
+        import winreg  # type: ignore
+    except ImportError:
+        return False, f"HKCU\\{subkey}: winreg unavailable"
+    try:
+        _recursive_reg_delete(winreg.HKEY_CURRENT_USER, subkey, winreg)
+        return True, f"HKCU\\{subkey}"
+    except FileNotFoundError:
+        return True, f"HKCU\\{subkey} (already gone)"
+    except OSError as e:
+        return False, f"HKCU\\{subkey}: {e}"
+
+
+def _recursive_reg_delete(hive, subkey: str, winreg) -> None:
+    """winreg has no built-in 'delete tree' — peel subkeys off until empty."""
+    # Open with KEY_ALL_ACCESS so we can enumerate + delete subkeys.
+    try:
+        with winreg.OpenKey(hive, subkey, 0, winreg.KEY_ALL_ACCESS) as key:
+            while True:
+                try:
+                    child = winreg.EnumKey(key, 0)
+                except OSError:
+                    break  # no more subkeys
+                _recursive_reg_delete(hive, f"{subkey}\\{child}", winreg)
+    except FileNotFoundError:
+        return
+    # All children gone — now drop the key itself.
+    winreg.DeleteKey(hive, subkey)
+
+
+# Keys to nuke. Keep this list narrow — we only want to clear sign-in
+# state, not preferences / graphics settings (which live in different
+# keys and the user probably wants to keep).
+_LOGIN_REG_KEYS = (
+    r"Software\Roblox\RobloxStudioBrowser",
+)
+
+
+def reset_roblox_login_state() -> dict:
+    """Clear the Roblox client's persisted sign-in state on this machine.
+
+    Returns a summary dict with the same shape as `wipe()`.
+    """
+    summary: dict = {"removed": [], "errors": []}
+
+    ok, note = _delete_localstorage()
+    (summary["removed"] if ok else summary["errors"]).append(note if ok else (note, ""))
+
+    for key in _LOGIN_REG_KEYS:
+        ok, note = _delete_registry_key(key)
+        if ok:
+            summary["removed"].append(note)
+        else:
+            summary["errors"].append((note, ""))
+
+    log.info("roblox login reset: removed=%d errors=%d",
+             len(summary["removed"]), len(summary["errors"]))
     return summary
