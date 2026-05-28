@@ -29,6 +29,15 @@ class Config:
     # "protocol": go through RobloxPlayerLauncher.exe (stable, default).
     # "direct":   spawn RobloxPlayerBeta.exe directly (faster, skips launcher).
     launch_mode: str = "protocol"
+    # Per-account LOCALAPPDATA isolation. When True (default), each launched
+    # client writes cookies / cache / logs into
+    # %APPDATA%\MultiRobloxManager\data\<user_id>\Roblox\, so alts don't see
+    # each other's state — reduces fingerprint linkage. Side effect: launches
+    # from outside the manager (e.g. clicking Play in your browser) can
+    # behave oddly because the system's "current account" state is now
+    # split across directories. Turn this off if you want browser launches
+    # to work the same as before any manager run.
+    account_isolation: bool = True
     # UI theme: "dark" or "light".
     theme: str = "dark"
     # Discord webhook URL fired when an instance crashes. Empty = disabled.
@@ -87,6 +96,7 @@ class ConfigStore:
             recent_places=data.get("recent_places", []),
             launch_cooldown=float(data.get("launch_cooldown", 6.0)),
             launch_mode=mode,
+            account_isolation=bool(data.get("account_isolation", True)),
             theme=theme,
             webhook_url=str(data.get("webhook_url", "")),
             webhook_on_crash=bool(data.get("webhook_on_crash", True)),
@@ -103,6 +113,7 @@ class ConfigStore:
                 "recent_places": self.cfg.recent_places,
                 "launch_cooldown": self.cfg.launch_cooldown,
                 "launch_mode": self.cfg.launch_mode,
+                "account_isolation": self.cfg.account_isolation,
                 "theme": self.cfg.theme,
                 "webhook_url": self.cfg.webhook_url,
                 "webhook_on_crash": self.cfg.webhook_on_crash,

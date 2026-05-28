@@ -63,6 +63,11 @@ class InstanceManager:
         self._last_launch = 0.0
         # Default. The GUI overrides this from the persisted config.
         self.launch_mode = "protocol"
+        # When False, _launch_process skips the LOCALAPPDATA env override.
+        # Default True keeps the previous per-account isolation behavior;
+        # set False if you also want to launch from the browser's Play
+        # button and have it work normally alongside manager launches.
+        self.account_isolation = True
         self.instances: list[Instance] = []
         # Optional callback fired exactly once when an instance transitions
         # from running -> crashed. The GUI uses this to post the Discord
@@ -138,7 +143,14 @@ class InstanceManager:
         """
         self._check_rate_limit()
         self._respect_cooldown()
-        env = profiles.env_for_account(account.user_id) if account else None
+        # Skip the LOCALAPPDATA override when isolation is disabled so
+        # browser-launched Roblox sessions read the same on-disk state
+        # as our managed launches.
+        env = (
+            profiles.env_for_account(account.user_id)
+            if account and self.account_isolation
+            else None
+        )
         proxy = account.proxy_or_none() if account else None
         log.info("launch start place=%s job=%s account=%s mode=%s",
                  place_id, job_id, account.label() if account else "(none)",

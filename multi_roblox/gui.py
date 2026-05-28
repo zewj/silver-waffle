@@ -174,6 +174,7 @@ class MainWindow(QMainWindow):
         self.manager = InstanceManager()
         self.manager.LAUNCH_COOLDOWN = self.config.cfg.launch_cooldown
         self.manager.launch_mode = self.config.cfg.launch_mode
+        self.manager.account_isolation = self.config.cfg.account_isolation
         # Fire-and-forget Discord webhook when an instance crashes. The
         # manager calls this from its 2s stats poll thread, so the slot
         # has to be thread-safe — emitting a queued signal is the simplest
@@ -250,6 +251,15 @@ class MainWindow(QMainWindow):
         act_bot = QAction("Discord Bot…", self)
         act_bot.triggered.connect(self._open_bot_settings)
         settings_menu.addAction(act_bot)
+        settings_menu.addSeparator()
+        # Checkable toggle for the LOCALAPPDATA isolation. When OFF,
+        # launches from the user's browser (Play button on roblox.com)
+        # see the same on-disk state as managed launches — useful when
+        # mixing manager + browser launches confused account routing.
+        self.act_isolation = QAction("Per-account isolation", self, checkable=True)
+        self.act_isolation.setChecked(self.config.cfg.account_isolation)
+        self.act_isolation.triggered.connect(self._on_toggle_isolation)
+        settings_menu.addAction(self.act_isolation)
 
         help_menu = bar.addMenu("&Help")
         act_about = QAction("About", self)
@@ -936,6 +946,21 @@ class MainWindow(QMainWindow):
     def _open_webhook_settings(self):
         dlg = WebhookSettingsDialog(self, self.config)
         dlg.exec()
+
+    def _on_toggle_isolation(self, checked: bool):
+        self.manager.account_isolation = checked
+        self.config.cfg.account_isolation = checked
+        self.config.save()
+        if checked:
+            self._set_status(
+                "Per-account isolation ON — alts write to per-account dirs; "
+                "browser Play button may launch the wrong account."
+            )
+        else:
+            self._set_status(
+                "Per-account isolation OFF — browser launches work normally; "
+                "alts share Roblox state on disk."
+            )
 
     def _open_bot_settings(self):
         dlg = BotSettingsDialog(self, self.config)
