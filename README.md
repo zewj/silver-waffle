@@ -252,6 +252,20 @@ multi_roblox/
   at the real binary directory.
 - `%APPDATA%\MultiRobloxManager\logs\manager.log` — rotating log file.
 
+## Wiping everything
+
+**File → Wipe All App Data…** deletes the entire
+`%APPDATA%\MultiRobloxManager\` folder — accounts, config, logs,
+per-account profile directories — terminates managed Roblox instances,
+stops the Discord bot, and quits. A confirmation dialog spells out
+what will be deleted before anything happens.
+
+The wipe explicitly removes per-account profile junctions via
+`cmd /c rmdir /Q` *before* recursing into the parent, so `shutil.rmtree`
+never traverses a junction into your real `%LOCALAPPDATA%\Roblox` and
+delete your actual Roblox install. The real install, the registry, and
+the manager's own exe are deliberately not touched.
+
 ## Known limitations / deliberately not built
 
 - **CustomTkinter port** — pure cosmetics; not done in this branch.

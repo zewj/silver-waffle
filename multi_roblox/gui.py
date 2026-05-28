@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from . import browser_login, discord_bot, launcher, logging_setup, screenshot, servers, webhook
+from . import browser_login, discord_bot, launcher, logging_setup, screenshot, servers, webhook, wipe
 from .accounts import AccountStore
 from .config import ConfigStore, Preset
 from .manager import InstanceManager
@@ -227,6 +227,12 @@ class MainWindow(QMainWindow):
         act_logs = QAction("Open Logs Folder", self)
         act_logs.triggered.connect(self._open_logs)
         file_menu.addAction(act_logs)
+        file_menu.addSeparator()
+        # "Nuke everything we ever wrote on disk and exit." Confirmed with
+        # an explicit type-to-confirm dialog so it can't fire accidentally.
+        act_wipe = QAction("Wipe All App Data…", self)
+        act_wipe.triggered.connect(self._on_wipe_data)
+        file_menu.addAction(act_wipe)
         file_menu.addSeparator()
         act_quit = QAction("Quit", self)
         act_quit.setShortcut("Ctrl+Q")
@@ -1018,6 +1024,67 @@ class MainWindow(QMainWindow):
         except Exception as e:
             log.exception("could not open log folder")
             QMessageBox.critical(self, "Logs", f"Could not open {self.log_path.parent}: {e}")
+
+    def _on_wipe_data(self):
+        """Show a hard confirmation dialog, then nuke %APPDATA%\\MultiRobloxManager\\.
+
+        Walks the user through exactly what's about to be deleted so they
+        can't trigger this by accident. After confirmation we:
+          1. Stop the Discord bot if running.
+          2. Terminate every Roblox client we tracked.
+          3. Release the singleton mutex.
+          4. Delete %APPDATA%\\MultiRobloxManager\\ (handles junctions safely).
+          5. Quit — the app's persistent state is gone so continuing would
+             only re-write fresh files we just spent effort deleting.
+        """
+        root = wipe.app_root()
+        msg = (
+            f"This will permanently delete:\n\n"
+            f"  • {root}\n"
+            f"    accounts.json (encrypted cookies)\n"
+            f"    config.json (presets, webhook, bot token)\n"
+            f"    logs\\\n"
+            f"    data\\<user_id>\\ (per-account profile dirs)\n\n"
+            f"It will also terminate every managed Roblox instance and the "
+            f"Discord bot (if running), then close this app.\n\n"
+            f"It does NOT touch your real Roblox install, the real "
+            f"%LOCALAPPDATA%\\Roblox folder, or this app's exe.\n\n"
+            f"Continue?"
+        )
+        if QMessageBox.question(
+            self, "Wipe all app data", msg,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+
+        # Stop the bot and shut down managed instances before deleting.
+        try:
+            self.stop_bot()
+        except Exception:
+            log.exception("bot shutdown during wipe failed")
+        try:
+            self.manager.shutdown()
+        except Exception:
+            log.exception("manager shutdown during wipe failed")
+
+        summary = wipe.wipe()
+        if summary["errors"]:
+            QMessageBox.warning(
+                self, "Wipe finished with errors",
+                "Some files could not be deleted (see log):\n\n"
+                + "\n".join(f"  • {p}: {why}" for p, why in summary["errors"][:10])
+            )
+        else:
+            QMessageBox.information(
+                self, "Wipe complete",
+                "All app data removed.\n"
+                f"({len(summary['removed'])} path(s), "
+                f"{summary['junctions_removed']} junction(s)).",
+            )
+
+        # Bypass the "Closing will terminate all managed Roblox instances"
+        # confirmation in closeEvent — the user already confirmed once.
+        QApplication.quit()
 
     def _show_about(self):
         QMessageBox.about(
