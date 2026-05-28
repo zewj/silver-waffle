@@ -68,6 +68,30 @@ class InstanceManager:
         # from running -> crashed. The GUI uses this to post the Discord
         # webhook so the manager itself stays free of webhook config.
         self.on_crash_callback = None
+        # Monotonic timestamp until which we refuse to make Roblox API
+        # calls. Set when a 429 lands so the next click doesn't pound
+        # the endpoint and dig the lockout deeper.
+        self._rate_limited_until = 0.0
+
+    @property
+    def rate_limited_seconds_remaining(self) -> float:
+        return max(0.0, self._rate_limited_until - time.monotonic())
+
+    def _check_rate_limit(self) -> None:
+        remaining = self.rate_limited_seconds_remaining
+        if remaining > 0:
+            raise auth.RateLimitError(
+                f"Rate-limited by Roblox; wait ~{int(remaining + 1)}s before "
+                "the next launch / hop. Use Focus to switch between already-"
+                "running accounts instead of close-and-relaunch.",
+                retry_after_sec=remaining,
+            )
+
+    def _record_rate_limit(self, retry_after: float) -> None:
+        # Pad slightly so we don't try again the literal millisecond the
+        # window expires (which sometimes still 429s).
+        self._rate_limited_until = time.monotonic() + retry_after + 2.0
+        log.warning("global rate-limit lockout: %.1fs", retry_after + 2.0)
 
     def start(self):
         self._mutex.acquire()
@@ -105,15 +129,14 @@ class InstanceManager:
                         job_id: Optional[str]) -> Optional[int]:
         """Spawn one client, returning the resolved RobloxPlayerBeta PID.
 
-        Protocol launches are preferred because RobloxPlayerLauncher handles
-        version updates and Hyperion's parent-process expectations. If the
-        protocol launch doesn't produce a new PID we fall back to direct
-        exec with a freshly minted ticket (auth tickets are single-use).
-
-        When `account` is provided we also override LOCALAPPDATA for the
-        spawned process so it writes cookies/cache/logs into a per-account
-        directory — isolation without disturbing the binaries.
+        Refuses to even contact Roblox if we're inside a known rate-limit
+        cooldown window — this is the difference between "user clicks
+        Launch 5 times in a row and digs the lockout deeper" and "user
+        sees the wait countdown and tries again later". RateLimitError
+        raised from the inner auth calls is also captured so the next
+        click sees the cooldown without making another HTTP request.
         """
+        self._check_rate_limit()
         self._respect_cooldown()
         env = profiles.env_for_account(account.user_id) if account else None
         proxy = account.proxy_or_none() if account else None
@@ -121,31 +144,44 @@ class InstanceManager:
                  place_id, job_id, account.label() if account else "(none)",
                  self.launch_mode)
 
-        if not account:
-            before = windows.list_roblox_pids()
-            uri = servers.join_uri(place_id, job_id) if job_id else servers.launch_uri(place_id)
-            windows.launch_uri(uri)
-            return self._wait_for_new_pid(before, self.PROTOCOL_PID_TIMEOUT)
+        try:
+            if not account:
+                before = windows.list_roblox_pids()
+                uri = servers.join_uri(place_id, job_id) if job_id else servers.launch_uri(place_id)
+                windows.launch_uri(uri)
+                return self._wait_for_new_pid(before, self.PROTOCOL_PID_TIMEOUT)
 
-        if self.launch_mode == "direct":
+            if self.launch_mode == "direct":
+                before = windows.list_roblox_pids()
+                ticket = auth.fetch_auth_ticket(account.cookie(), proxy=proxy)
+                launcher.launch_with_ticket(ticket, place_id, job_id=job_id, env=env)
+                return self._wait_for_new_pid(before, self.DIRECT_PID_TIMEOUT)
+
+            # protocol-first; fall back to direct only if we're not under
+            # rate-limit pressure (the fallback mints a *second* ticket,
+            # doubling the per-cookie burn during a 429 storm).
+            before = windows.list_roblox_pids()
+            ticket = auth.fetch_auth_ticket(account.cookie(), proxy=proxy)
+            launcher.launch_protocol_with_ticket(ticket, place_id, job_id=job_id, env=env)
+            pid = self._wait_for_new_pid(before, self.PROTOCOL_PID_TIMEOUT)
+            if pid:
+                return pid
+            if self.rate_limited_seconds_remaining > 0:
+                log.warning("protocol launch stalled for %s; skipping direct "
+                            "fallback because we're rate-limited", account.label())
+                return None
+            log.warning("protocol launch stalled for %s; falling back to direct exec",
+                        account.label())
             before = windows.list_roblox_pids()
             ticket = auth.fetch_auth_ticket(account.cookie(), proxy=proxy)
             launcher.launch_with_ticket(ticket, place_id, job_id=job_id, env=env)
             return self._wait_for_new_pid(before, self.DIRECT_PID_TIMEOUT)
-
-        # protocol-first with direct fallback
-        before = windows.list_roblox_pids()
-        ticket = auth.fetch_auth_ticket(account.cookie(), proxy=proxy)
-        launcher.launch_protocol_with_ticket(ticket, place_id, job_id=job_id, env=env)
-        pid = self._wait_for_new_pid(before, self.PROTOCOL_PID_TIMEOUT)
-        if pid:
-            return pid
-        log.warning("protocol launch stalled for %s; falling back to direct exec",
-                    account.label())
-        before = windows.list_roblox_pids()
-        ticket = auth.fetch_auth_ticket(account.cookie(), proxy=proxy)
-        launcher.launch_with_ticket(ticket, place_id, job_id=job_id, env=env)
-        return self._wait_for_new_pid(before, self.DIRECT_PID_TIMEOUT)
+        except auth.RateLimitError as e:
+            # Trap, record on the global clock, re-raise. Future
+            # _launch_process calls see the cooldown immediately at the
+            # _check_rate_limit() call above.
+            self._record_rate_limit(e.retry_after_sec)
+            raise
 
     def add_instance(self, label: str, place_id: int,
                      account: Optional[Account] = None,
@@ -211,14 +247,19 @@ class InstanceManager:
         return affected
 
     def server_hop(self, inst: Instance) -> Optional[str]:
+        self._check_rate_limit()  # surface clean cooldown error before any network
         # Route the server-list lookup through the account's proxy too, so
         # the IP discovering the candidate list matches the IP that'll
         # ultimately join. Otherwise a SOCKS5'd account would fetch from
         # the local egress and then connect from the proxy egress.
         proxy = inst.account.proxy_or_none() if inst.account else None
-        srv = servers.pick_server(
-            inst.place_id, exclude_job_ids=inst.recent_jobs, proxy=proxy,
-        )
+        try:
+            srv = servers.pick_server(
+                inst.place_id, exclude_job_ids=inst.recent_jobs, proxy=proxy,
+            )
+        except auth.RateLimitError as e:
+            self._record_rate_limit(e.retry_after_sec)
+            raise
         if not srv:
             log.info("hop: no eligible server for place %s", inst.place_id)
             return None

@@ -732,6 +732,15 @@ class MainWindow(QMainWindow):
             self._refresh_tree()
         except Exception:
             log.exception("stats refresh failed")
+        # Surface the rate-limit countdown directly in the status bar so
+        # the user knows "wait, then click" instead of "click, see error,
+        # click again, see error".
+        remaining = self.manager.rate_limited_seconds_remaining
+        if remaining > 0:
+            self._set_status(
+                f"Rate-limited by Roblox • {int(remaining + 1)}s until next "
+                f"launch / hop allowed • use Focus to switch already-running accounts"
+            )
 
     def _on_instance_crashed(self, inst):
         """Slot for the _crashed signal. Runs on the GUI thread."""
